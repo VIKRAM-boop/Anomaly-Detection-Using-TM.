@@ -47,6 +47,9 @@ def find_dir(name):
             return candidate
     return here / name
 
+if not (PARQUET / "train_windowed.parquet").exists():
+    PARQUET = find_dir("data") / "temporal"
+
 def macro_f1(y, p):
     return precision_recall_fscore_support(y, p, average="macro", zero_division=0)[2]
 
