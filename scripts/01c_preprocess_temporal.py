@@ -40,6 +40,8 @@ def find_dir(name):
     return here / name
 
 DATA_DIR = Path("/tmp/tmwork2")
+if not (DATA_DIR / "train_windowed.parquet").exists():
+    DATA_DIR = find_dir("data") / "temporal"
 
 def quantile_literals(train_vals, test_vals, feature_name):
     thresholds = np.nanquantile(train_vals, QUANTILE_LEVELS)
