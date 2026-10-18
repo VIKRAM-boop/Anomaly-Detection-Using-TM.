@@ -16,6 +16,7 @@ under explicit control, and is reported alongside the benign recall it costs.
 Reads the saved bank scores, so it needs no retraining.
 """
 import json
+import os
 from pathlib import Path
 
 import numpy as np
@@ -28,6 +29,15 @@ FALSE_UNKNOWN_BUDGETS = [0.01, 0.02, 0.05, 0.10, 0.20]
 REPORT_BUDGETS = [0.01, 0.05, 0.10, 0.20]
 
 def find_dir(name):
+    # TM_DATA_DIR redirects the data tree to scratch storage. Writing several
+    # GB of .npy into a Dropbox-synced folder intermittently fails with
+    # TimeoutError [Errno 60] partway through a write.
+    if name == "data":
+        override = os.environ.get("TM_DATA_DIR")
+        if override:
+            p = Path(override)
+            p.mkdir(parents=True, exist_ok=True)
+            return p
     here = Path(__file__).resolve().parent
     for candidate in (here.parent / name, here / name):
         if candidate.exists():

@@ -12,6 +12,7 @@ Takes the held-out class name as argv[1]. Writes X_train/y_train/X_test/y_test
 and meta.json to data/openset_<scale>_<class>/.
 """
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -36,6 +37,15 @@ BINARY_PASSTHROUGH_COLS = ["is_ftp_login", "is_sm_ips_ports"]
 LABEL_FIXES = {"Backdoors": "Backdoor"}
 
 def find_dir(name):
+    # TM_DATA_DIR redirects the data tree to scratch storage. Writing several
+    # GB of .npy into a Dropbox-synced folder intermittently fails with
+    # TimeoutError [Errno 60] partway through a write.
+    if name == "data":
+        override = os.environ.get("TM_DATA_DIR")
+        if override:
+            p = Path(override)
+            p.mkdir(parents=True, exist_ok=True)
+            return p
     here = Path(__file__).resolve().parent
     for candidate in (here.parent / name, here / name):
         if candidate.exists():

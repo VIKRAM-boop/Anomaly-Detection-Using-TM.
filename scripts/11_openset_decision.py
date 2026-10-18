@@ -20,6 +20,7 @@ Takes the held-out class name as argv[1] and writes summary.json alongside
 the bank scores so 13_openset_summary.py can collect every hold-out.
 """
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -35,6 +36,15 @@ VAL_FRACTION = 0.10
 FALSE_UNKNOWN_BUDGETS = [0.01, 0.02, 0.05, 0.10, 0.20]
 
 def find_dir(name):
+    # TM_DATA_DIR redirects the data tree to scratch storage. Writing several
+    # GB of .npy into a Dropbox-synced folder intermittently fails with
+    # TimeoutError [Errno 60] partway through a write.
+    if name == "data":
+        override = os.environ.get("TM_DATA_DIR")
+        if override:
+            p = Path(override)
+            p.mkdir(parents=True, exist_ok=True)
+            return p
     here = Path(__file__).resolve().parent
     for candidate in (here.parent / name, here / name):
         if candidate.exists():

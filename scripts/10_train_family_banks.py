@@ -16,6 +16,7 @@ dataset. Saves per-bank validation and test scores to
 data/banks_<scale>_<class>/.
 """
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -35,6 +36,15 @@ RANDOM_STATE = 42
 NORMAL_NAME = "Normal"
 
 def find_dir(name):
+    # TM_DATA_DIR redirects the data tree to scratch storage. Writing several
+    # GB of .npy into a Dropbox-synced folder intermittently fails with
+    # TimeoutError [Errno 60] partway through a write.
+    if name == "data":
+        override = os.environ.get("TM_DATA_DIR")
+        if override:
+            p = Path(override)
+            p.mkdir(parents=True, exist_ok=True)
+            return p
     here = Path(__file__).resolve().parent
     for candidate in (here.parent / name, here / name):
         if candidate.exists():
