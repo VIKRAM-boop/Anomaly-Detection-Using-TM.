@@ -155,6 +155,48 @@ undersample, and test accuracy rises with it (0.944 to 0.952). The synthetic
 rows actively interfere with fitting the real distribution; smote only comes
 out ahead once calibration compensates for the prior it distorts.
 
+## RF / Decision Tree baselines
+
+The baselines are a comparison point, not subjects of the resampling study, so
+they get real data: majorities capped at 40,000 for tractability, every
+minority class untouched, nothing synthesised, and `class_weight` in the
+search grid. 142,521 fit rows. Hyperparameters selected on the same
+chronological validation partition; test scored once.
+
+| model | test acc | weighted F1 | macro F1 | selected config |
+|---|---|---|---|---|
+| Random Forest | 0.9596 | 0.9652 | **0.5961 ± 0.0017** | 100 trees, depth 30, leaf 5, max_features 0.3, class_weight=balanced |
+| Decision Tree | 0.9577 | 0.9612 | 0.5199 ± 0.0002 | depth 20, leaf 20, gini, class_weight=None |
+| TM (best configuration) | 0.9518 | 0.9582 | 0.4699 | smote + calibration tau=30 + multi-scale ensemble |
+
+Random Forest previously scored 0.5644 macro F1 when trained on SMOTE'd data.
+Dropping synthesis and adding class weighting raises it to 0.5961. Both
+changed at once, so the gain cannot be attributed to either alone, but the
+search selected `class_weight='balanced'` as the winner, which is the direct
+evidence that trees want weighting rather than synthetic rows.
+
+### Rare-class F1
+
+| class | support | RF | DT | TM |
+|---|---|---|---|---|
+| Worms | 52 | **0.60** | 0.28 | 0.08 |
+| Shellcode | 440 | **0.56** | 0.52 | 0.25 |
+| Backdoor | 702 | **0.16** | 0.09 | 0.07 |
+| Analysis | 678 | 0.10 | 0.10 | 0.09 |
+| Reconnaissance | 4,064 | **0.83** | 0.81 | 0.67 |
+| DoS | 5,161 | **0.49** | 0.22 | 0.45 |
+| Exploits | 12,850 | 0.65 | **0.67** | 0.57 |
+| Fuzzers | 6,711 | **0.57** | 0.54 | 0.51 |
+| Generic | 68,460 | 0.99 | 0.99 | 0.99 |
+| Normal | 408,930 | 0.99 | 0.99 | 0.99 |
+
+This corrects a conclusion drawn from the TM results alone. The TM's failure
+on Worms (F1 0.08 with 40,000 synthetic rows) looked like a data ceiling —
+103 real rows not containing enough signal to learn from. Random Forest
+reaches F1 0.60 on the same 103 rows with no synthetic data at all, so the
+signal is present and learnable. The ceiling belongs to the TM configuration,
+not to the dataset, and SMOTE moved it in the wrong direction.
+
 ## Known gaps
 
 - **TM hyperparameters were not re-tuned.** `clauses=2000, T=200, s=5.0` were
