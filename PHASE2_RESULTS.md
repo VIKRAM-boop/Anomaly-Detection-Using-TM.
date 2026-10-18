@@ -124,28 +124,101 @@ Under `selfsup`, all three rules catch 0.0% up to the 10% budget. Fusion
 cannot rescue a misplaced benign gate, which makes the conclusion about
 self-supervised normality robust to the fusion choice.
 
-## Item 4 — why withheld Fuzzers were classified as Normal
+## Item 4 — leave-one-attack-family-out
 
-Largely because the threshold was chosen on contaminated data.
+Eight families were held out in turn, each excluded from fit and validation
+and relabelled unknown in test. Medium scale, supervised normality. Worms is
+omitted: 52 test rows is too few for a catch rate to mean anything.
+
+All figures below come from `14_openset_redecide.py`, which pins tau_B to a
+1% missed-attack budget. That matters -- see the threshold-sensitivity note
+below -- and numbers from `11_openset_decision.py`, which maximises balanced
+accuracy instead, are not comparable with these.
+
+| held out | rows | AUROC | @1% | @5% | @10% | @20% | ->Normal | known acc |
+|---|---|---|---|---|---|---|---|---|
+| Fuzzers | 6,711 | 0.861 | 13.6% | **38.8%** | 52.0% | 75.1% | 2.1% | 0.9783 |
+| Shellcode | 440 | 0.812 | 12.0% | 23.9% | 41.1% | 65.2% | 0.5% | 0.9746 |
+| Exploits | 12,850 | 0.739 | 4.2% | 11.7% | 30.7% | 55.4% | 25.1% | 0.9823 |
+| DoS | 5,161 | 0.825 | 2.2% | 7.0% | 38.0% | 77.2% | 2.2% | 0.9800 |
+| Reconnaissance | 4,064 | 0.618 | 3.7% | 6.8% | 16.8% | **34.7%** | 0.2% | 0.9789 |
+| Analysis | 678 | 0.806 | 0.1% | 5.8% | 25.2% | 71.2% | 0.4% | 0.9823 |
+| Backdoor | 702 | 0.804 | 1.3% | 4.7% | 21.8% | 68.9% | 3.1% | 0.9757 |
+| Generic | 68,460 | 0.872 | 0.1% | 0.6% | 2.1% | **16.2%** | **81.6%** | 0.9490 |
+
+### Two mutually-confusable groups
+
+Where held-out rows go at the 5% budget:
+
+| held out | top destinations | share into its group |
+|---|---|---|
+| DoS | Analysis 49.4%, Backdoor 23.6% | 73.0% |
+| Analysis | Backdoor 44.7%, DoS 28.9% | 73.6% |
+| Backdoor | Analysis 50.1%, DoS 31.3% | 81.4% |
+| Reconnaissance | Shellcode 60.8%, Worms 13.4% | 60.8% |
+| Shellcode | Reconnaissance 27.7%, Backdoor 21.6% | 27.7% |
+
+**{DoS, Analysis, Backdoor}** is a tight three-way cluster: each member sends
+73-81% of its rows to the other two, and all three behave almost identically
+(4.7-7.0% caught at the 5% budget, 69-77% at 20%). This reproduces the same
+finding from the pre-correction sweep, so it is a property of the data rather
+than an artifact of the leak.
+
+**{Reconnaissance, Shellcode}** is a pair, but an asymmetric one.
+Reconnaissance collapses into Shellcode far more readily than the reverse,
+and Shellcode is four times more detectable as novel (23.9% vs 6.8%).
+
+### Two failure modes, not one
+
+The families fail for opposite reasons, and the `->Normal` column separates
+them cleanly:
+
+- **Family confusion.** Analysis, Backdoor, DoS, Reconnaissance and
+  Shellcode leak 0.2-3.1% to Normal. Their benign gate works; they are lost
+  to sibling families instead.
+- **Benign leakage.** Generic (81.6%) and Exploits (25.1%) are waved through
+  as normal traffic and never reach the unknown branch at all.
+
+Fuzzers originally belonged to the second group at 18.9%, and the Phase 1
+and Phase 2 leak corrections moved it to the first at 2.1%. Generic and
+Exploits did not move comparably: Generic went 94.9% -> 81.6%, so its benign
+leakage is real rather than a thresholding artifact.
+
+### Generic is extraordinarily threshold-sensitive
+
+Generic behaves completely differently under the two tau_B rules:
+
+| rule | tau_B | ->Normal | caught @20% |
+|---|---|---|---|
+| balanced accuracy (`11`) | +104 | ~0% | 97.5% |
+| 1% missed-attack budget (`14`) | -119 | 81.6% | 16.2% |
+
+No other family comes close to this sensitivity. The cause is that Generic
+looks benign *relative to the other attack families*: a threshold calibrated
+so only 1% of known attacks appear benign lands at -119, and most Generic
+rows score above it. Which threshold rule you pick decides whether Generic is
+the best-detected family or the worst.
+
+This is worth stating plainly because it is easy to mislead yourself here.
+Two different rules, applied to identical bank scores, support opposite
+conclusions about the same family.
+
+### Why withheld Fuzzers were classified as Normal
 
 | pipeline | Fuzzers -> Normal |
 |---|---|
-| Before (leaky validation, medium scale) | 18.9% |
-| After (clean chronological validation, medium supervised) | **2.1%** |
-| After, max-fused across scales | 2.6% |
+| Before (leaky validation) | 18.9% |
+| After (clean chronological validation) | **2.1%** |
 
-The normality branch was not blind to Fuzzers. The benign threshold tau_B
-was being selected against a validation set made mostly of SMOTE
-interpolations, which are easier to separate than real traffic, so the
-threshold landed in the wrong place. With a clean validation partition and
-the held-out family excluded from validation as well as training, the leak
-falls by roughly nine-fold and UNKNOWN becomes the dominant outcome for
-held-out Fuzzers rows.
+For Fuzzers specifically, the answer is that the benign threshold was being
+chosen against a validation set composed mostly of SMOTE interpolations,
+which are easier to separate than real traffic, so tau_B landed in the wrong
+place. With a clean validation partition and the held-out family excluded
+from validation as well as training, the leak falls roughly nine-fold and
+UNKNOWN becomes the dominant outcome.
 
-Note that the spec's proposed remedy for this symptom moves it the wrong
-way: self-supervised normality leaks 11.5-13.5% and combined leaks 26.7-34.4%.
-
-Leave-one-family-out across the remaining families is not yet run.
+The spec's proposed remedy moves this symptom the wrong way: self-supervised
+normality leaks 11.5-13.5% and combined leaks 26.7-34.4%.
 
 ## Item 5 — clause extraction and explanation quality
 
@@ -224,7 +297,6 @@ leak, track what the system actually does and should be quoted instead.
 
 ## Known gaps
 
-- Leave-one-attack-family-out covers Fuzzers only so far.
 - Single seed throughout, so differences under roughly 0.01 should not be
   read as real.
 - The fusion rule and the perturbation scheme are both interpretations, as
