@@ -147,6 +147,69 @@ way: self-supervised normality leaks 11.5-13.5% and combined leaks 26.7-34.4%.
 
 Leave-one-family-out across the remaining families is not yet run.
 
+## Item 5 — clause extraction and explanation quality
+
+The methodology asks for explanations to be assessed but gives no measures,
+so these definitions are used (and stated in `16_clause_explain.py`):
+
+- **fidelity** — share of rows where a surrogate using only the k most
+  discriminative clauses per class reproduces the full model's prediction.
+  These banks run with `weighted_clauses` disabled, so every weight is 1 and
+  a class sum is just a count of firing clauses. Ranking by weight is
+  therefore meaningless; clauses are ranked by how much more often they fire
+  on their own class than on others.
+- **stability** — mean Jaccard overlap between a row's firing-clause set and
+  that of a copy with one literal flipped, over five draws per row.
+- **complexity** — literals per firing clause, and clauses firing per row.
+
+Medium scale, smote strategy, 300 test rows, full-model accuracy 0.950:
+
+| k | fidelity |
+|---|---|
+| 1 | **94.7%** |
+| 3 | 96.0% |
+| 10 | 95.7% |
+| 25 | 97.0% |
+| 100 | 97.0% |
+| 500 | 96.7% |
+
+| measure | value |
+|---|---|
+| stability (Jaccard, one literal flipped) | 0.832 |
+| clauses firing per row | mean 289.9, median 281, max 498 |
+| literals per firing clause | mean 10.5, median 1, max 339 |
+
+**One discriminative clause per class reproduces the model's decision on
+94.7% of rows**, and the curve is flat from there: going from one clause to
+five hundred adds about two points. Around 290 clauses fire per row, but
+they are heavily redundant rather than each carrying part of the decision.
+
+Individual clauses are short -- the median firing clause contains a single
+literal -- so explanations are readable in the ordinary sense. A worked
+example, a correctly predicted Normal row with 307 firing clauses:
+
+```
+clause   5: NOT sttl>Q90 AND ct_srv_src>Q25
+clause 704: NOT ct_state_ttl>Q50
+clause 703: medium_dst_entropy>Q25
+clause 700: NOT ct_state_ttl>Q50 AND ct_srv_src>Q50
+clause 692: medium_dst_entropy>Q50
+```
+
+Stability of 0.832 means a single flipped literal leaves about 83% of the
+firing set unchanged, so explanations do not reshuffle under small input
+changes.
+
+Caveat: fidelity is measured against the model's own output, not ground
+truth. It says the explanation is faithful to the model, not that the model
+is correct.
+
+A first version of this measurement ranked clauses by weight and reported
+fidelity of 1.0% at k=10. That was an artifact: with all weights equal to 1
+every class's top-k sum is min(k, clauses fired), so all classes tie and
+argmax always returns class 0. The 1.0% was simply how often class 0 was the
+right answer.
+
 ## A note on AUROC
 
 AUROC is reported by these scripts but should not lead the results. It is
@@ -162,8 +225,6 @@ leak, track what the system actually does and should be quoted instead.
 ## Known gaps
 
 - Leave-one-attack-family-out covers Fuzzers only so far.
-- Explanation metrics (item 5) are implemented in `16_clause_explain.py`
-  with definitions given in its docstring; results pending.
 - Single seed throughout, so differences under roughly 0.01 should not be
   read as real.
 - The fusion rule and the perturbation scheme are both interpretations, as

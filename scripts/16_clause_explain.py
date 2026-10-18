@@ -10,10 +10,14 @@ fired on it, written out as those conjunctions.
 The methodology asks for explanations to be assessed but does not define the
 measures, so these are the definitions used here:
 
-  fidelity    the share of rows where a surrogate built from only the top-k
-              highest-weight firing clauses per class reproduces the full
-              model's prediction. A faithful explanation should let you
-              recover the decision from the clauses alone.
+  fidelity    the share of rows where a surrogate built from only the k
+              most discriminative clauses per class reproduces the full
+              model's prediction. These banks run with weighted_clauses
+              disabled, so every weight is 1 and a class sum is simply a
+              count of firing clauses; ranking by weight would be
+              meaningless. Clauses are therefore ranked by how much more
+              often they fire on their own class than on others, measured
+              on a held-out sample.
 
   stability   mean Jaccard overlap between the firing-clause set of a row
               and that of a minimally perturbed copy of the same row (one
@@ -45,7 +49,7 @@ S = 5.0
 EPOCHS = 1
 TM_SEED = 42
 RANDOM_STATE = 42
-TOP_K = [1, 3, 5, 10, 25, 50]      # surrogate sizes for fidelity
+TOP_K = [1, 3, 5, 10, 25, 50, 100, 250, 500]   # surrogate sizes for fidelity
 N_PERTURB = 5                       # perturbed copies per row for stability
 N_EXAMPLE_CLAUSES = 5               # clauses printed in the worked example
 
@@ -90,17 +94,36 @@ def class_sums(tm, encoded_X, e):
         sums[i] = np.clip(np.dot(w, o).astype(np.int32), -tm.T, tm.T)
     return sums
 
-def topk_sums(tm, encoded_X, e, k):
-    """Class sums restricted to each class's k highest-weight firing clauses."""
+def clause_discriminativeness(tm, encoded_X, y, n_rows):
+    """Per class, how much more often each clause fires on its own class
+    than on the rest. With unweighted banks this is the only ranking
+    available: all weights are 1, so a class sum is a count of firing
+    clauses and weight order carries no information."""
+    n_cls = tm.number_of_classes
+    own = [np.zeros(NUMBER_OF_CLAUSES) for _ in range(n_cls)]
+    other = [np.zeros(NUMBER_OF_CLAUSES) for _ in range(n_cls)]
+    own_n = np.zeros(n_cls); other_n = np.zeros(n_cls)
+    for e in range(n_rows):
+        c_true = int(y[e])
+        for i in range(n_cls):
+            o = np.asarray(tm.clause_banks[i].calculate_clause_outputs_predict(encoded_X, e))
+            if i == c_true:
+                own[i] += o; own_n[i] += 1
+            else:
+                other[i] += o; other_n[i] += 1
+    rank = []
+    for i in range(n_cls):
+        a = own[i] / max(own_n[i], 1)
+        b = other[i] / max(other_n[i], 1)
+        rank.append(np.argsort(-(a - b)))      # most discriminative first
+    return rank
+
+def topk_sums(tm, encoded_X, e, k, rank):
+    """Class sums restricted to each class's k most discriminative clauses."""
     sums = np.zeros(tm.number_of_classes)
     for i in range(tm.number_of_classes):
-        w = np.asarray(tm.weight_banks[i].get_weights())
         o = np.asarray(tm.clause_banks[i].calculate_clause_outputs_predict(encoded_X, e))
-        fired = np.where(o > 0)[0]
-        if len(fired) == 0:
-            continue
-        top = fired[np.argsort(-w[fired])[:k]]
-        sums[i] = w[top].sum()
+        sums[i] = o[rank[i][:k]].sum()
     return sums
 
 def main():
@@ -159,10 +182,12 @@ def main():
           f"median {np.median(lits_per_clause):.0f}, max {np.max(lits_per_clause)}")
 
     # --- fidelity ---
-    print("\n=== fidelity (surrogate from top-k firing clauses per class) ===")
+    print("\n=== fidelity (surrogate from k most discriminative clauses per class) ===")
+    print("  ranking clauses...", flush=True)
+    rank = clause_discriminativeness(tm, enc, y, min(150, len(X)))
     fid = {}
     for k in TOP_K:
-        agree = np.array([topk_sums(tm, enc, e, k).argmax() for e in range(len(X))])
+        agree = np.array([topk_sums(tm, enc, e, k, rank).argmax() for e in range(len(X))])
         fid[k] = float((agree == full_pred).mean())
         print(f"  top-{k:<3d} reproduces the full prediction on {fid[k]:.1%} of rows")
 
