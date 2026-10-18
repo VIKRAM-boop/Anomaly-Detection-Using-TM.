@@ -16,8 +16,9 @@ operating points rather than a single number.
 The comparison point is a closed-set model, which has no unknown option
 and therefore misclassifies every held-out row by construction.
 
-Takes the held-out class name as argv[1] and writes summary.json alongside
-the bank scores so 13_openset_summary.py can collect every hold-out.
+Takes the held-out class as argv[1], the temporal scale as argv[2] and the
+normality mode as argv[3], and writes summary.json alongside the bank
+scores.
 """
 import json
 import os
@@ -28,7 +29,6 @@ import numpy as np
 from sklearn.metrics import (accuracy_score, precision_recall_fscore_support,
                              roc_auc_score)
 
-SCALE = "medium"
 RANDOM_STATE = 42
 VAL_FRACTION = 0.10
 # operating points, expressed as the share of known validation rows we are
@@ -64,18 +64,19 @@ def decide(s_benign, s_family, families, tau_b, tau_a, normal_idx, unknown_label
 
 def main():
     held = sys.argv[1] if len(sys.argv) > 1 else "DoS"
-    banks = find_dir("data") / f"banks_{SCALE}_{held.lower()}"
+    scale = sys.argv[2] if len(sys.argv) > 2 else "medium"
+    mode = sys.argv[3] if len(sys.argv) > 3 else "supervised"
+    suffix = "" if mode == "supervised" else f"_{mode}"
+    banks = find_dir("data") / f"banks_{scale}_{held.lower()}{suffix}"
     meta = json.load(open(banks / "banks_meta.json"))
     families = meta["families"]
     normal_idx = meta["normal_idx"]
     names = meta["all_class_names"]
     held_out_idx = meta["held_out_idx"]
     unknown_label = meta["unknown_label"]
-    n_real = meta["n_real_train_rows"]
 
     y_val = np.load(banks / "y_val.npy")
-    val_idx = np.load(banks / "val_idx.npy")
-    y_test = np.load(find_dir("data") / f"openset_{SCALE}_{held.lower()}" / "y_test.npy")
+    y_test = np.load(find_dir("data") / f"openset_{scale}_{held.lower()}" / "y_test.npy")
 
     val_b = np.load(banks / "val_normal.npy")
     test_b = np.load(banks / "test_normal.npy")
@@ -83,9 +84,10 @@ def main():
     test_f = np.stack([np.load(banks / f"test_fam{c}.npy") for c in families], axis=1)
 
     # only real validation rows are a fair surface for choosing thresholds
-    real = val_idx < n_real
-    vb, vf, vy = val_b[real], val_f[real], y_val[real]
-    print(f"validation: {real.sum()} real rows of {len(val_idx)}")
+    # validation is the chronological tail of the training period: all real,
+    # and with the held-out family already removed
+    vb, vf, vy = val_b, val_f, y_val
+    print(f"validation: {len(y_val)} real rows (held-out family excluded)")
     print(f"held out as unknown: {names[held_out_idx]} "
           f"({(y_test == unknown_label).sum()} test rows)\n")
 
@@ -159,6 +161,7 @@ def main():
 
     with open(banks / "summary.json", "w") as f:
         json.dump({"held_out_class": names[held_out_idx],
+                   "scale": scale, "normality_mode": mode,
                    "n_unknown_test_rows": int(is_unknown.sum()),
                    "tau_B": float(best_tau_b),
                    "tau_B_balanced_acc": float(best_bal),

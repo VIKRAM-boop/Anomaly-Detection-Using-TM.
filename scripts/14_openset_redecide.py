@@ -23,7 +23,6 @@ import numpy as np
 from sklearn.metrics import (accuracy_score, precision_recall_fscore_support,
                              roc_auc_score)
 
-SCALE = "medium"
 MISSED_ATTACK_BUDGET = 0.01     # share of known attack val rows allowed to look benign
 FALSE_UNKNOWN_BUDGETS = [0.01, 0.02, 0.05, 0.10, 0.20]
 REPORT_BUDGETS = [0.01, 0.05, 0.10, 0.20]
@@ -62,11 +61,10 @@ def evaluate(banks):
     names = meta["all_class_names"]
     held = names[meta["held_out_idx"]]
     unknown_label = meta["unknown_label"]
-    n_real = meta["n_real_train_rows"]
 
     y_val = np.load(banks / "y_val.npy")
-    val_idx = np.load(banks / "val_idx.npy")
-    y_test = np.load(find_dir("data") / f"openset_{SCALE}_{held.lower()}" / "y_test.npy")
+    scale = meta.get("scale", "medium")
+    y_test = np.load(find_dir("data") / f"openset_{scale}_{held.lower()}" / "y_test.npy")
     y_test = y_test.astype(np.int64)
 
     val_b = np.load(banks / "val_normal.npy")
@@ -74,8 +72,7 @@ def evaluate(banks):
     val_f = np.stack([np.load(banks / f"val_fam{c}.npy") for c in families], axis=1)
     test_f = np.stack([np.load(banks / f"test_fam{c}.npy") for c in families], axis=1)
 
-    real = val_idx < n_real
-    vb, vf, vy = val_b[real], val_f[real], y_val[real]
+    vb, vf, vy = val_b, val_f, y_val
 
     # tau_B at a fixed missed-attack budget, so every hold-out uses the same rule
     val_attack_rows = vy != normal_idx
@@ -111,6 +108,8 @@ def evaluate(banks):
     closed[test_b >= tau_b] = normal_idx
     return {
         "held_out_class": held,
+        "scale": scale,
+        "normality_mode": meta.get("normality_mode", "supervised"),
         "n_unknown_test_rows": int(is_unknown.sum()),
         "tau_B": tau_b,
         "benign_recall_at_tau_B": benign_recall,
@@ -126,7 +125,7 @@ def evaluate(banks):
 def main():
     data = find_dir("data")
     results = []
-    for d in sorted(data.glob(f"banks_{SCALE}_*")):
+    for d in sorted(data.glob("banks_*")):
         if (d / "banks_meta.json").exists() and (d / "test_normal.npy").exists():
             try:
                 results.append(evaluate(d))
@@ -137,12 +136,12 @@ def main():
         return
 
     results.sort(key=lambda r: -r["auroc_known_vs_unknown"])
-    print(f"leave-one-class-out open-set results, {SCALE} scale, "
-          f"{len(results)} hold-outs")
+    print(f"leave-one-class-out open-set results, {len(results)} runs")
     print(f"tau_B pinned at a {MISSED_ATTACK_BUDGET:.0%} missed-attack budget "
           f"on known validation rows\n")
 
-    head = f"{'held out':<16}{'rows':>7}{'AUROC':>8}{'tau_B':>8}{'ben.rec':>9}"
+    head = (f"{'held out':<16}{'scale':>7}{'mode':>11}{'rows':>7}"
+            f"{'AUROC':>8}{'tau_B':>8}{'ben.rec':>9}")
     for b in REPORT_BUDGETS:
         head += f"{'@' + format(b, '.0%'):>9}"
     head += f"{'known acc':>11}{'closed':>9}"
@@ -150,7 +149,8 @@ def main():
     print("-" * len(head))
     for r in results:
         by = {round(c["budget"], 4): c for c in r["curve"]}
-        line = (f"{r['held_out_class']:<16}{r['n_unknown_test_rows']:>7d}"
+        line = (f"{r['held_out_class']:<16}{r['scale']:>7}{r['normality_mode']:>11}"
+                f"{r['n_unknown_test_rows']:>7d}"
                 f"{r['auroc_known_vs_unknown']:>8.3f}{r['tau_B']:>8.0f}"
                 f"{r['benign_recall_at_tau_B']:>9.3f}")
         for b in REPORT_BUDGETS:
@@ -166,12 +166,13 @@ def main():
     print("novel rows wrongly routed to Normal (these never reach the unknown branch):")
     for r in results:
         by = {round(c["budget"], 4): c for c in r["curve"]}
-        print(f"  {r['held_out_class']:<16} {by[0.05]['novel_called_benign']:>6.1%}")
+        print(f"  {r['held_out_class']:<12}{r['scale']:>7}{r['normality_mode']:>11}"
+              f"{by[0.05]['novel_called_benign']:>8.1%}")
 
-    with open(data / f"openset_sweep_{SCALE}.json", "w") as f:
+    with open(data / "openset_sweep.json", "w") as f:
         json.dump({"missed_attack_budget": MISSED_ATTACK_BUDGET,
                    "results": results}, f, indent=2)
-    print(f"\nwritten to {data / f'openset_sweep_{SCALE}.json'}")
+    print(f"\nwritten to {data / 'openset_sweep.json'}")
 
 if __name__ == "__main__":
     main()
