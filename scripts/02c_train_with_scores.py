@@ -2,7 +2,8 @@
 Trains a Tsetlin Machine on one temporal scale.
 
 Takes a scale name, seed and optionally a resampling strategy as arguments.
-Trains on the resampled fit partition for EPOCHS epochs and reports train
+Trains on the resampled fit partition with the hyperparameters chosen by
+17_tune_tm.py (data/tuned/closed.json) and reports train
 accuracy plus a per-class report on validation and test.
 
 The validation partition is the real, untouched chronological tail of the
@@ -11,7 +12,8 @@ were fitted on -- so it is a fair surface for model selection. The test set
 is only scored, never selected on.
 
 Saves the raw per-class vote scores for the validation and test splits,
-which TMClassifier.predict() computes internally but discards. Writes to
+which TMClassifier.predict() computes internally but discards; they are
+computed with tm_fast, checked against tmu on every run. Writes to
 data/scores_<scale>_seed<seed>/.
 """
 import json
@@ -27,10 +29,10 @@ from sklearn.metrics import (
 )
 from tmu.tsetlin_machine import TMClassifier
 
-# Chosen by validation-only sweep (see 02d/02e/02f). The inherited paper-2
-# config (1000/300/3.0) scored 0.6397 val macro F1; this scores 0.7004.
-# The controlling factor turned out to be the T/clauses ratio (~0.10 peak),
-# not either value alone -- consistent with class_sum being clipped to [-T, T].
+import tm_fast
+
+# Defaults, used only when data/tuned/closed.json (17_tune_tm.py, selected on
+# the corrected validation partition) is absent.
 NUMBER_OF_CLAUSES = 2000
 T = 200
 S = 5.0
@@ -63,30 +65,19 @@ def find_dir(name):
             return candidate
     return here / name
 
-def predict_scores(tm, X, batch_report=None):
-    """Per-class vote sums for every row -- the values predict() computes
-    then discards. Mirrors TMClassifier.predict()'s inner loop exactly,
-    including the clip to [-T, T]."""
-    if not np.array_equal(tm.X_test, X):
-        tm.encoded_X_test = tm.clause_banks[0].prepare_X(X)
-        tm.X_test = X.copy()
-    scores = np.zeros((X.shape[0], tm.number_of_classes), dtype=np.int32)
-    for e in range(X.shape[0]):
-        for i in range(tm.number_of_classes):
-            class_sum = np.dot(
-                tm.weight_banks[i].get_weights(),
-                tm.clause_banks[i].calculate_clause_outputs_predict(tm.encoded_X_test, e),
-            ).astype(np.int32)
-            scores[e, i] = np.clip(class_sum, -tm.T, tm.T)
-        if batch_report and e and e % batch_report == 0:
-            print(f"    scored {e}/{X.shape[0]}", flush=True)
-    return scores
+def load_config():
+    f = find_dir("data") / "tuned" / "closed.json"
+    if f.exists():
+        c = json.load(open(f))["best"]
+        return int(c["clauses"]), int(c["T"]), float(c["s"]), int(c["epochs"]), str(f)
+    return NUMBER_OF_CLAUSES, T, S, EPOCHS, "default"
 
 def main(scale, tm_seed=TM_SEED, strategy="smote"):
+    n_clauses, t_val, s_val, epochs, cfg_src = load_config()
     np.random.seed(tm_seed)   # TMClassifier draws from the global RNG
     suffix = "" if strategy == "smote" else f"_{strategy}"
     data_dir = find_dir("data") / f"temporal_{scale}{suffix}"
-    X_fit = np.load(data_dir / "X_fit.npy")
+    X_fit = np.ascontiguousarray(np.load(data_dir / "X_fit.npy"), dtype=np.uint32)
     y_fit = np.load(data_dir / "y_fit.npy")
     X_val = np.load(data_dir / "X_val.npy")
     y_val = np.load(data_dir / "y_val.npy")
@@ -97,29 +88,32 @@ def main(scale, tm_seed=TM_SEED, strategy="smote"):
 
     print(f"TM_{scale} (seed {tm_seed}, {strategy}): fit={X_fit.shape} "
           f"val={X_val.shape} test={X_test.shape}", flush=True)
-    print(f"params: clauses={NUMBER_OF_CLAUSES}, T={T}, s={S}, epochs={EPOCHS}", flush=True)
+    print(f"params: clauses={n_clauses}, T={t_val}, s={s_val}, epochs={epochs} ({cfg_src})", flush=True)
 
-    tm = TMClassifier(number_of_clauses=NUMBER_OF_CLAUSES, T=T, s=S,
+    tm = TMClassifier(number_of_clauses=n_clauses, T=t_val, s=s_val,
                        weighted_clauses=WEIGHTED_CLAUSES)
     # validation is what gets watched across epochs; the test set is not
     # looked at until the model is final
-    for epoch in range(1, EPOCHS + 1):
+    for epoch in range(1, epochs + 1):
         t0 = time.perf_counter()
         tm.fit(X_fit, y_fit)
-        val_pred = tm.predict(X_val)
+        model = tm_fast.extract_tm(tm)
+        val_pred = tm_fast.class_sums(model, X_val).argmax(axis=1)
         val_acc = accuracy_score(y_val, val_pred)
         val_f1 = precision_recall_fscore_support(y_val, val_pred, average="macro",
                                                   zero_division=0)[2]
-        print(f"TM_{scale} epoch {epoch:2d}/{EPOCHS}  val_acc={val_acc:.4f}  "
+        print(f"TM_{scale} epoch {epoch:2d}/{epochs}  val_acc={val_acc:.4f}  "
               f"val_macro_f1={val_f1:.4f}  ({time.perf_counter()-t0:.0f}s)", flush=True)
 
-    train_acc = accuracy_score(y_fit, tm.predict(X_fit))
+    tm_fast.verify_against_tmu(tm, X_val, n=500)
+    model = tm_fast.extract_tm(tm)
+    train_acc = accuracy_score(y_fit, tm_fast.class_sums(model, X_fit).argmax(axis=1))
     print(f"TM_{scale} TRAIN accuracy = {train_acc:.4f}", flush=True)
 
     print(f"TM_{scale}: scoring val split...", flush=True)
-    val_scores = predict_scores(tm, X_val)
+    val_scores = tm_fast.class_sums(model, X_val).astype(np.int32)
     print(f"TM_{scale}: scoring test split...", flush=True)
-    test_scores = predict_scores(tm, X_test, batch_report=100000)
+    test_scores = tm_fast.class_sums(model, X_test).astype(np.int32)
 
     out_dir = find_dir("data") / f"scores_{scale}_seed{tm_seed}{suffix}"
     out_dir.mkdir(parents=True, exist_ok=True)

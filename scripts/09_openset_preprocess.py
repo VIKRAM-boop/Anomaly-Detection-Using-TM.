@@ -9,10 +9,12 @@ its test rows are kept and relabelled as the unknown class. Quantile
 thresholds, one-hot categories and relational thresholds come from fit rows
 only, and resampling touches fit rows only.
 
-Takes the held-out class as argv[1] and the temporal scale as argv[2]
-(short, medium or long -- Step 4 calls for a separate clause bank per
-scale). Writes X_fit/y_fit, X_val/y_val, X_test/y_test and meta.json to
-data/openset_<scale>_<class>/.
+Takes the held-out class as argv[1] and builds all three temporal scales
+(short, medium, long -- Step 4 calls for a separate clause bank per scale) in
+one pass, sharing the parquet load and the scale-independent base literals.
+Literals are stored as uint8: as uint32 the 27 family x scale datasets
+would need about 49 GB. Writes X_fit/y_fit, X_val/y_val, X_test/y_test and
+meta.json to data/openset_<scale>_<class>/.
 """
 import json
 import os
@@ -65,18 +67,36 @@ def quantile_literals(fit_vals, other_vals, feature_name):
     thresholds = np.nanquantile(fit_vals, QUANTILE_LEVELS)
     names = [f"{feature_name}>Q{int(q*100)}" for q in QUANTILE_LEVELS]
     def encode(v):
-        return np.stack([(np.nan_to_num(v, nan=-np.inf) > t).astype(np.uint32)
-                          for t in thresholds], axis=1)
+        v = np.nan_to_num(v, nan=-np.inf)
+        return np.stack([(v > t) for t in thresholds], axis=1).astype(np.uint8)
     return encode(fit_vals), [encode(v) for v in other_vals], names
+
+def resample_fit(X_fit, y_fit_full):
+    """Cap majorities at PER_CLASS_CAP, then SMOTE the rest up to it."""
+    rng = np.random.default_rng(RANDOM_STATE)
+    keep_idx = []
+    for cls in np.unique(y_fit_full):
+        idx = np.where(y_fit_full == cls)[0]
+        keep_idx.append(rng.choice(idx, PER_CLASS_CAP, replace=False)
+                        if len(idx) > PER_CLASS_CAP else idx)
+    keep_idx = np.concatenate(keep_idx)
+    X_capped, y_capped = X_fit[keep_idx], y_fit_full[keep_idx]
+    counts = np.bincount(y_capped)
+    present = [int(c) for c in np.unique(y_capped)]
+    oversamplable = [c for c in present if counts[c] >= 2]
+    targets = {c: max(PER_CLASS_CAP, int(counts[c])) for c in oversamplable}
+    k = max(1, min(5, min(int(counts[c]) for c in oversamplable) - 1))
+    # float32 then threshold: interpolating unsigned ints wraps 0-1 around
+    X_bal_f, y_bal = SMOTE(random_state=RANDOM_STATE, sampling_strategy=targets,
+                            k_neighbors=k).fit_resample(X_capped.astype(np.float32), y_capped)
+    X_bal = (X_bal_f >= 0.5).astype(np.uint8)
+    return X_bal, y_bal
 
 def main():
     held_out_class = sys.argv[1] if len(sys.argv) > 1 else "DoS"
-    scale = sys.argv[2] if len(sys.argv) > 2 else "medium"
-    if scale not in WINDOW_SCALES:
-        raise SystemExit(f"scale must be one of {WINDOW_SCALES}, got {scale!r}")
-    print(f"=== held out: {held_out_class} | scale: {scale} ===")
+    scales = sys.argv[2].split(",") if len(sys.argv) > 2 else WINDOW_SCALES
+    print(f"=== held out: {held_out_class} | scales: {scales} ===", flush=True)
 
-    print("=== loading windowed parquet ===")
     train_df = pd.read_parquet(DATA_DIR / "train_windowed.parquet")
     test_df = pd.read_parquet(DATA_DIR / "test_windowed.parquet")
     train_df["attack_cat"] = train_df["attack_cat"].replace(LABEL_FIXES)
@@ -86,19 +106,17 @@ def main():
     target_encoder = LabelEncoder().fit(train_df["attack_cat"])
     all_class_names = list(target_encoder.classes_)
     held_out_idx = all_class_names.index(held_out_class)
-    y_train_full = target_encoder.transform(train_df["attack_cat"])
     y_test_orig = target_encoder.transform(test_df["attack_cat"])
-    print(f"all classes: {all_class_names}")
 
     # the held-out family leaves both fit and validation, so it is unseen
-    # during training and during model selection alike
+    # during training, calibration and hyperparameter selection alike
     train_df = train_df.sort_values("ts").reset_index(drop=True)
     y_train_full = target_encoder.transform(train_df["attack_cat"])
     keep = y_train_full != held_out_idx
     train_df = train_df.loc[keep].reset_index(drop=True)
     y_known = y_train_full[keep]
-    print(f"  train rows removed: {int((~keep).sum())} (remaining {len(train_df)})")
-    print(f"  test rows kept as unknown: {int((y_test_orig == held_out_idx).sum())}")
+    print(f"  train rows removed: {int((~keep).sum())} | test unknown rows: "
+          f"{int((y_test_orig == held_out_idx).sum())}", flush=True)
 
     split_idx = int(len(train_df) * (1 - VAL_FRACTION))
     val_time = train_df["ts"].iloc[split_idx]
@@ -106,9 +124,10 @@ def main():
     fit_df = train_df.loc[is_fit].reset_index(drop=True)
     val_df = train_df.loc[~is_fit].reset_index(drop=True)
     y_fit_full, y_val = y_known[is_fit], y_known[~is_fit]
-    print(f"  fit={len(fit_df)} < {val_time} <= val={len(val_df)}")
+    del train_df
+    print(f"  fit={len(fit_df)} < {val_time} <= val={len(val_df)}", flush=True)
 
-    # --- literals, all thresholds from fit rows only ---
+    # --- scale-independent base literals, thresholds from fit rows only ---
     base_cols = [c for c in fit_df.columns
                  if c not in DROP_COLS + CATEGORICAL_COLS + ["attack_cat"]
                  and not c.startswith(tuple(f"{sc}_" for sc in WINDOW_SCALES))]
@@ -121,7 +140,7 @@ def main():
         fit_blocks.append(fb); val_blocks.append(vb); test_blocks.append(xb)
         names.extend(nm)
 
-    cat_encoder = OneHotEncoder(handle_unknown="ignore", sparse_output=False, dtype=np.uint32)
+    cat_encoder = OneHotEncoder(handle_unknown="ignore", sparse_output=False, dtype=np.uint8)
     cat_encoder.fit(fit_df[CATEGORICAL_COLS])
     fit_blocks.append(cat_encoder.transform(fit_df[CATEGORICAL_COLS]))
     val_blocks.append(cat_encoder.transform(val_df[CATEGORICAL_COLS]))
@@ -129,98 +148,82 @@ def main():
     names.extend(cat_encoder.get_feature_names_out(CATEGORICAL_COLS))
 
     # is_ftp_login holds 0/1/2/4 in the raw capture, so it is thresholded
-    # rather than passed through, identically across all three partitions
     def binary_block(df):
         return (df[BINARY_PASSTHROUGH_COLS].fillna(0).to_numpy(dtype=np.float64) > 0
-                ).astype(np.uint32)
+                ).astype(np.uint8)
     fit_blocks.append(binary_block(fit_df))
     val_blocks.append(binary_block(val_df))
     test_blocks.append(binary_block(test_df))
     names.extend(BINARY_PASSTHROUGH_COLS)
 
-    rel_names, rel_fit, rel_val, rel_test = [], [], [], []
+    rel_fit, rel_val, rel_test = [], [], []
     for df, store in ((fit_df, rel_fit), (val_df, rel_val), (test_df, rel_test)):
         ratio = (df["sbytes"] + 1) / (df["dbytes"] + 1)
-        store.append((ratio > 2).astype(np.uint32).to_numpy())
-        store.append((ratio < 0.5).astype(np.uint32).to_numpy())
-    rel_names += ["R_outbound_heavy", "R_inbound_heavy"]
+        store.append((ratio > 2).to_numpy().astype(np.uint8))
+        store.append((ratio < 0.5).to_numpy().astype(np.uint8))
+    rel_names = ["R_outbound_heavy", "R_inbound_heavy"]
     for nm, ((c1, l1), (c2, l2)) in {
         "R_many_conn_same_dst": (("ct_dst_ltm", 0.75), ("ct_srv_dst", 0.75)),
         "R_slow_handshake": (("synack", 0.75), ("tcprtt", 0.75)),
     }.items():
         t1, t2 = np.nanquantile(fit_df[c1], l1), np.nanquantile(fit_df[c2], l2)
         for df, store in ((fit_df, rel_fit), (val_df, rel_val), (test_df, rel_test)):
-            store.append(((df[c1] > t1) & (df[c2] > t2)).astype(np.uint32).to_numpy())
+            store.append(((df[c1] > t1) & (df[c2] > t2)).to_numpy().astype(np.uint8))
         rel_names.append(nm)
     fit_blocks.append(np.stack(rel_fit, axis=1))
     val_blocks.append(np.stack(rel_val, axis=1))
     test_blocks.append(np.stack(rel_test, axis=1))
     names.extend(rel_names)
 
-    for suf in WINDOW_FEATURE_SUFFIXES:
-        col = f"{scale}_{suf}"
-        fb, (vb, xb), nm = quantile_literals(
-            fit_df[col].to_numpy(dtype=np.float64),
-            [val_df[col].to_numpy(dtype=np.float64),
-             test_df[col].to_numpy(dtype=np.float64)], col)
-        fit_blocks.append(fb); val_blocks.append(vb); test_blocks.append(xb)
-        names.extend(nm)
+    base_fit = np.concatenate(fit_blocks, axis=1)
+    base_val = np.concatenate(val_blocks, axis=1)
+    base_test = np.concatenate(test_blocks, axis=1)
+    del fit_blocks, val_blocks, test_blocks
+    base_names = list(names)
 
-    X_fit = np.concatenate(fit_blocks, axis=1).astype(np.uint32)
-    X_val = np.concatenate(val_blocks, axis=1).astype(np.uint32)
-    X_test = np.concatenate(test_blocks, axis=1).astype(np.uint32)
-    print(f"\nliterals: {X_fit.shape[1]}")
-
-    # --- resampling, fit rows only ---
-    rng = np.random.default_rng(RANDOM_STATE)
-    keep_idx = []
-    for cls in np.unique(y_fit_full):
-        idx = np.where(y_fit_full == cls)[0]
-        keep_idx.append(rng.choice(idx, PER_CLASS_CAP, replace=False)
-                        if len(idx) > PER_CLASS_CAP else idx)
-    keep_idx = np.concatenate(keep_idx)
-    X_capped, y_capped = X_fit[keep_idx], y_fit_full[keep_idx]
-    print(f"after cap: {dict(zip(*np.unique(y_capped, return_counts=True)))}")
-
-    # float32 then threshold: SMOTE on uint32 underflows (0-1 wraps to 4294967295)
-    counts = np.bincount(y_capped)
-    present = [int(c) for c in np.unique(y_capped)]
-    oversamplable = [c for c in present if counts[c] >= 2]
-    targets = {c: max(PER_CLASS_CAP, int(counts[c])) for c in oversamplable}
-    k = max(1, min(5, min(int(counts[c]) for c in oversamplable) - 1))
-    X_bal_f, y_bal = SMOTE(random_state=RANDOM_STATE, sampling_strategy=targets,
-                            k_neighbors=k).fit_resample(X_capped.astype(np.float32), y_capped)
-    X_bal = (X_bal_f >= 0.5).astype(np.uint32)
-    assert set(np.unique(X_bal)).issubset({0, 1}), "non-binary values after SMOTE"
-    print(f"after SMOTE: {dict(zip(*np.unique(y_bal, return_counts=True)))}")
-
-    # held-out rows in the test set become the unknown class
     y_test = y_test_orig.copy()
     y_test[y_test_orig == held_out_idx] = UNKNOWN_LABEL
 
-    out = find_dir("data") / f"openset_{scale}_{held_out_class.lower()}"
-    out.mkdir(parents=True, exist_ok=True)
-    np.save(out / "X_fit.npy", X_bal)
-    np.save(out / "y_fit.npy", y_bal.astype(np.uint32))
-    np.save(out / "X_val.npy", X_val)
-    np.save(out / "y_val.npy", y_val.astype(np.uint32))
-    np.save(out / "X_test.npy", X_test)
-    np.save(out / "y_test.npy", y_test.astype(np.uint32))
-    with open(out / "meta.json", "w") as f:
-        json.dump({"all_class_names": all_class_names,
-                   "held_out_class": held_out_class,
-                   "held_out_idx": int(held_out_idx),
-                   "unknown_label": UNKNOWN_LABEL,
-                   "known_classes": sorted(int(c) for c in np.unique(y_bal)),
-                   "n_fit_real": int(len(y_fit_full)),
-                   "fit_class_counts_real": np.bincount(
-                       y_fit_full, minlength=len(all_class_names)).tolist(),
-                   "n_fit": int(len(y_bal)), "n_val": int(len(y_val)),
-                   "n_test": int(len(y_test)),
-                   "n_literals": int(X_bal.shape[1]),
-                   "val_split_time": str(val_time),
-                   "scale": scale, "feature_names": list(names)}, f, indent=2)
-    print(f"saved to {out}")
+    for scale in scales:
+        wf, wv, wt, wn = [], [], [], []
+        for suf in WINDOW_FEATURE_SUFFIXES:
+            col = f"{scale}_{suf}"
+            fb, (vb, xb), nm = quantile_literals(
+                fit_df[col].to_numpy(dtype=np.float64),
+                [val_df[col].to_numpy(dtype=np.float64),
+                 test_df[col].to_numpy(dtype=np.float64)], col)
+            wf.append(fb); wv.append(vb); wt.append(xb); wn.extend(nm)
+        X_fit = np.concatenate([base_fit] + wf, axis=1)
+        X_val = np.concatenate([base_val] + wv, axis=1)
+        X_test = np.concatenate([base_test] + wt, axis=1)
+        X_bal, y_bal = resample_fit(X_fit, y_fit_full)
+        del X_fit
+        assert X_bal.max() <= 1 and X_val.max() <= 1 and X_test.max() <= 1
+
+        out = find_dir("data") / f"openset_{scale}_{held_out_class.lower()}"
+        out.mkdir(parents=True, exist_ok=True)
+        np.save(out / "X_fit.npy", X_bal)
+        np.save(out / "y_fit.npy", y_bal.astype(np.uint8))
+        np.save(out / "X_val.npy", X_val)
+        np.save(out / "y_val.npy", y_val.astype(np.uint8))
+        np.save(out / "X_test.npy", X_test)
+        np.save(out / "y_test.npy", y_test.astype(np.uint8))
+        with open(out / "meta.json", "w") as f:
+            json.dump({"all_class_names": all_class_names,
+                       "held_out_class": held_out_class,
+                       "held_out_idx": int(held_out_idx),
+                       "unknown_label": UNKNOWN_LABEL,
+                       "known_classes": sorted(int(c) for c in np.unique(y_bal)),
+                       "n_fit_real": int(len(y_fit_full)),
+                       "fit_class_counts_real": np.bincount(
+                           y_fit_full, minlength=len(all_class_names)).tolist(),
+                       "n_fit": int(len(y_bal)), "n_val": int(len(y_val)),
+                       "n_test": int(len(y_test)),
+                       "n_literals": int(X_bal.shape[1]),
+                       "val_split_time": str(val_time),
+                       "scale": scale, "feature_names": base_names + wn}, f, indent=2)
+        print(f"  {scale}: fit {X_bal.shape} val {X_val.shape} test {X_test.shape} "
+              f"-> {out.name}", flush=True)
 
 if __name__ == "__main__":
     main()

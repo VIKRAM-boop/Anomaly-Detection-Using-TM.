@@ -17,7 +17,7 @@ Takes the resampling strategy as argv[1] -- one of smote (every class
 raised to PER_CLASS_CAP), moderate (minorities raised to at most
 MODERATE_MULTIPLE times their real count) or undersample (majorities cut to
 UNDERSAMPLE_CAP, no synthetic rows at all). Writes X_fit/y_fit, X_val/y_val,
-X_test/y_test and meta.json to data/temporal_<scale>[_<strategy>]/.
+X_test/y_test (literals as uint8) and meta.json to data/temporal_<scale>[_<strategy>]/.
 """
 import json
 import os
@@ -258,11 +258,11 @@ def main():
         suffix = "" if strategy == "smote" else f"_{strategy}"
         out_dir = find_dir("data") / f"temporal_{scale}{suffix}"
         out_dir.mkdir(parents=True, exist_ok=True)
-        np.save(out_dir / "X_fit.npy", X_fit_bal)
+        np.save(out_dir / "X_fit.npy", X_fit_bal.astype(np.uint8))
         np.save(out_dir / "y_fit.npy", y_fit_bal.astype(np.uint32))
-        np.save(out_dir / "X_val.npy", X_val)
+        np.save(out_dir / "X_val.npy", X_val.astype(np.uint8))
         np.save(out_dir / "y_val.npy", y_val.astype(np.uint32))
-        np.save(out_dir / "X_test.npy", X_test)
+        np.save(out_dir / "X_test.npy", X_test.astype(np.uint8))
         np.save(out_dir / "y_test.npy", y_test.astype(np.uint32))
         with open(out_dir / "meta.json", "w") as f:
             json.dump({"class_names": class_names, "feature_names": feature_names,
