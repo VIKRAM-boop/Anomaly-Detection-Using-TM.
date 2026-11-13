@@ -94,9 +94,11 @@ def main(scale, tm_seed=TM_SEED, strategy="smote"):
                        weighted_clauses=WEIGHTED_CLAUSES)
     # validation is what gets watched across epochs; the test set is not
     # looked at until the model is final
+    train_seconds = 0.0
     for epoch in range(1, epochs + 1):
         t0 = time.perf_counter()
         tm.fit(X_fit, y_fit)
+        train_seconds += time.perf_counter() - t0
         model = tm_fast.extract_tm(tm)
         val_pred = tm_fast.class_sums(model, X_val).argmax(axis=1)
         val_acc = accuracy_score(y_val, val_pred)
@@ -111,9 +113,11 @@ def main(scale, tm_seed=TM_SEED, strategy="smote"):
     print(f"TM_{scale} TRAIN accuracy = {train_acc:.4f}", flush=True)
 
     print(f"TM_{scale}: scoring val split...", flush=True)
+    t0 = time.perf_counter()
     val_scores = tm_fast.class_sums(model, X_val).astype(np.int32)
     print(f"TM_{scale}: scoring test split...", flush=True)
     test_scores = tm_fast.class_sums(model, X_test).astype(np.int32)
+    score_seconds = time.perf_counter() - t0
 
     out_dir = find_dir("data") / f"scores_{scale}_seed{tm_seed}{suffix}"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -121,6 +125,12 @@ def main(scale, tm_seed=TM_SEED, strategy="smote"):
     np.save(out_dir / "y_val.npy", y_val)
     np.save(out_dir / "test_scores.npy", test_scores)
     np.save(out_dir / "y_test.npy", y_test)
+    with open(out_dir / "run_meta.json", "w") as f:
+        json.dump({"scale": scale, "seed": tm_seed, "strategy": strategy,
+                   "config": {"clauses": n_clauses, "T": t_val, "s": s_val, "epochs": epochs},
+                   "n_fit": int(X_fit.shape[0]), "n_literals": int(X_fit.shape[1]),
+                   "train_seconds": train_seconds, "score_seconds": score_seconds,
+                   "n_scored_rows": int(len(X_val) + len(X_test))}, f, indent=2)
 
     val_pred = val_scores.argmax(axis=1)
     vp, vr, vf1, _ = precision_recall_fscore_support(y_val, val_pred, average="macro",

@@ -28,6 +28,16 @@ threshold is calibrated on validation to the same false-rejection budgets as
 Unknown -- and the same metrics are reported. Stochastic methods are run
 over the same five seeds as the TM.
 
+BASELINE_REPR selects the input representation for the Task 2 comparison
+(written to data/phase3/baselines_openset_<repr>.json; RF and XGBoost only):
+
+  continuous         default: every continuous feature, including the
+                     window features of all three scales
+  continuous_medium  per-flow plus medium-window features only -- the same
+                     information TM_medium is given
+  boolean            the TM's own literals: 09's "none" variant, which holds
+                     exactly the capped real rows used here (asserted)
+
 Writes data/phase3/baselines_openset.json.
 
 Usage: 20_openset_baselines.py [family ...]
@@ -63,6 +73,9 @@ RF_GRID = [{"n_estimators": 100, "max_depth": d, "min_samples_leaf": l,
             "max_features": 0.3, "class_weight": "balanced"} for d in (None, 30) for l in (1, 5)]
 XGB_GRID = [{"n_estimators": 300, "max_depth": d, "learning_rate": 0.1,
              "subsample": 0.9, "colsample_bytree": 0.8} for d in (6, 10)]
+REPR = os.environ.get("BASELINE_REPR", "continuous")
+if os.environ.get("BASELINE_SEEDS"):          # e.g. "42,7,1234"
+    SEEDS = [int(x) for x in os.environ["BASELINE_SEEDS"].split(",")]
 if os.environ.get("BASELINE_QUICK"):          # smoke test only
     SEEDS, RF_GRID, XGB_GRID = SEEDS[:1], RF_GRID[:1], XGB_GRID[:1]
 
@@ -93,6 +106,8 @@ def load_partitions(family, tr_all, te_all):
     meta = json.load(open(find_dir("data") / f"openset_medium_{family.lower()}" / "meta.json"))
     assert str(val_time) == meta["val_split_time"], "partition differs from the TM's"
     cols = [c for c in tr.columns if c not in DROP + ["attack_cat"]]
+    if REPR == "continuous_medium":
+        cols = [c for c in cols if not c.startswith(("short_", "long_"))]
     fit, val = tr.loc[is_fit, cols].copy(), tr.loc[~is_fit, cols].copy()
     test = te_all[cols].copy()
     for c in CAT:
@@ -183,7 +198,8 @@ def main():
     for f in (tr_all, te_all):
         f["attack_cat"] = f["attack_cat"].replace({"Backdoors": "Backdoor"})
 
-    out_path = data / "phase3" / "baselines_openset.json"
+    out_path = data / "phase3" / ("baselines_openset.json" if REPR == "continuous"
+                                  else f"baselines_openset_{REPR}.json")
     out_path.parent.mkdir(parents=True, exist_ok=True)
     results = json.load(open(out_path)) if out_path.exists() else {}
 
@@ -194,6 +210,14 @@ def main():
         fams = [c for c in known_classes if c != ni]
         rng = np.random.default_rng(42)
         Xc, yc = cap(Xf, yf, rng)
+        if REPR == "boolean":
+            bd = data / f"openset_medium_{family.lower()}_none"
+            assert np.array_equal(np.load(bd / "y_fit.npy"), yc), "rows differ from 09's"
+            assert np.array_equal(np.load(bd / "y_val.npy"), yv)
+            assert np.array_equal(np.load(bd / "y_test.npy"), yt)
+            Xc, Xv, Xt = (np.load(bd / f"{n}.npy").astype(np.float32)
+                          for n in ("X_fit", "X_val", "X_test"))
+        del Xf
         print(f"\n=== held out {family}: fit {Xc.shape} val {Xv.shape} test {Xt.shape} ===", flush=True)
         fam_res = {"methods": {}}
 
@@ -215,6 +239,8 @@ def main():
 
         classes = np.array(known_classes)
         per_seed = {m: {} for m in ("rf_msp", "xgb_msp", "iforest_rf")}
+        if REPR != "continuous":
+            del per_seed["iforest_rf"]
         for s in SEEDS:
             rf = rf_make(rf_best, s).fit(Xc, yc)
             per_seed["rf_msp"][s] = run_single_stage("rf", rf.predict_proba(Xv), rf.predict_proba(Xt),
@@ -222,6 +248,10 @@ def main():
             xg = xgb_make(xgb_best, s).fit(Xc, yc_enc, sample_weight=w[yc_enc])
             per_seed["xgb_msp"][s] = run_single_stage("xgb", xg.predict_proba(Xv), xg.predict_proba(Xt),
                                                       classes, yv, yt, known_classes, fams, ni)
+            if REPR != "continuous":
+                print(f"  seed {s}: rf {per_seed['rf_msp'][s]['0.05']['unknown_recall']:.1%}  "
+                      f"xgb {per_seed['xgb_msp'][s]['0.05']['unknown_recall']:.1%}", flush=True)
+                continue
             # two-stage: Isolation Forest benign gate + RF attack novelty
             iso = IsolationForest(n_estimators=200, random_state=s, n_jobs=N_JOBS).fit(Xc[yc == ni])
             bv, bt = iso.score_samples(Xv), iso.score_samples(Xt)       # higher = more normal
@@ -252,6 +282,19 @@ def main():
                   f"xgb {per_seed['xgb_msp'][s]['0.05']['unknown_recall']:.1%}  "
                   f"iforest_rf {res['0.05']['unknown_recall']:.1%}", flush=True)
 
+        if REPR != "continuous":
+            for m in per_seed:
+                fam_res["methods"][m] = {"seeds": per_seed[m]}
+            fam_res["selected"] = {"rf": rf_best, "rf_val_f1": rf_f1, "xgb": xgb_best,
+                                   "xgb_val_f1": xgb_f1}
+            fam_res["n_unknown"] = int((yt == UNKNOWN_LABEL).sum())
+            fam_res["n_features"] = int(Xc.shape[1])
+            results[family.lower()] = fam_res
+            with open(out_path, "w") as f:
+                json.dump(results, f, indent=2, default=float)
+            print(f"  {family} ({REPR}, {Xc.shape[1]} features) done in "
+                  f"{time.perf_counter()-t0:.0f}s", flush=True)
+            continue
         # deterministic distance-based baseline
         Zf, Zv, Zt = log_std(Xc, Xc), log_std(Xv, Xc), log_std(Xt, Xc)
         means = np.stack([Zf[yc == c].mean(0) for c in known_classes])

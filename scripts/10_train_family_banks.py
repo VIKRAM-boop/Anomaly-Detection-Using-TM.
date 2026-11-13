@@ -17,7 +17,11 @@ test margins plus each bank's clause masks and weights -- enough to rescore
 and to explain predictions without retraining -- to
 data/banks_<scale>_<family>_s<seed>/.
 
-Usage: 10_train_family_banks.py <family> <scale> <seed>
+An optional fourth argument picks 09's resampling variant (smote, the
+original, or ros / none for the Task 1 comparison); its banks are written
+to data/banks_<scale>_<family>_<strategy>_s<seed>/.
+
+Usage: 10_train_family_banks.py <family> <scale> <seed> [strategy]
 """
 import json
 import os
@@ -55,8 +59,10 @@ def main():
     family = sys.argv[1] if len(sys.argv) > 1 else "Fuzzers"
     scale = sys.argv[2] if len(sys.argv) > 2 else "medium"
     seed = int(sys.argv[3]) if len(sys.argv) > 3 else 42
+    strategy = sys.argv[4] if len(sys.argv) > 4 else "smote"
+    sfx = "" if strategy == "smote" else f"_{strategy}"
 
-    data_dir = find_dir("data") / f"openset_{scale}_{family.lower()}"
+    data_dir = find_dir("data") / f"openset_{scale}_{family.lower()}{sfx}"
     meta = json.load(open(data_dir / "meta.json"))
     names = meta["all_class_names"]
     normal_idx = names.index(NORMAL_NAME)
@@ -86,7 +92,7 @@ def main():
     val_f1 = banks.closed_macro_f1(val_s, y_val, families, normal_idx)
     print(f"validation known-class macro F1: {val_f1:.4f}", flush=True)
 
-    out = find_dir("data") / f"banks_{scale}_{family.lower()}_s{seed}"
+    out = find_dir("data") / f"banks_{scale}_{family.lower()}{sfx}_s{seed}"
     (out / "models").mkdir(parents=True, exist_ok=True)
     np.save(out / "y_val.npy", y_val)
     for k in models:
@@ -96,7 +102,7 @@ def main():
     with open(out / "banks_meta.json", "w") as f:
         json.dump({"families": families, "normal_idx": normal_idx,
                    "all_class_names": names, "scale": scale, "seed": seed,
-                   "config": cfg, "config_source": cfg_src,
+                   "config": cfg, "config_source": cfg_src, "strategy": strategy,
                    "held_out_class": meta["held_out_class"],
                    "held_out_idx": meta["held_out_idx"],
                    "unknown_label": meta["unknown_label"],

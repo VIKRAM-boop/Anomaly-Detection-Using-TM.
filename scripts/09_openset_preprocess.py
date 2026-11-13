@@ -15,6 +15,31 @@ one pass, sharing the parquet load and the scale-independent base literals.
 Literals are stored as uint8: as uint32 the 27 family x scale datasets
 would need about 49 GB. Writes X_fit/y_fit, X_val/y_val, X_test/y_test and
 meta.json to data/openset_<scale>_<class>/.
+
+Two optional arguments produce variants for the resampling and encoding
+studies (written to data/openset_<scale>_<class>_<strategy>[_q<n>]/; the
+defaults reproduce the original dataset and directory name):
+
+  strategy  smote  cap majorities at PER_CLASS_CAP, SMOTE minorities up to
+                   it on the binary literals, threshold back at 0.5 (original)
+            ros    same cap, minorities raised to the cap by duplicating
+                   real rows (random oversampling, nothing synthesised)
+            none   same cap only; minorities keep their real size. The
+                   banks then balance each binary problem by undersampling
+                   (banks.balanced_binary). The capped rows are exactly the
+                   rows 20_openset_baselines.py trains on, so the
+                   continuous and Boolean baselines see the same flows.
+  quantiles number of thresholds per continuous feature: 5 is the original
+            {10,25,50,75,90}th percentiles; any other n uses n evenly
+            spaced percentiles strictly between 0 and 100
+
+Every variant shares the base dataset's validation and test rows. When the
+base directory exists, a variant's X_val/X_test are compared with it and,
+if byte-identical, stored as symlinks, so identical partitions are both
+guaranteed and cheap. fit_synthetic.npy marks the fit rows that are not
+real observations (SMOTE output or ROS duplicates).
+
+Usage: 09_openset_preprocess.py <family> [scales] [strategy] [quantiles]
 """
 import json
 import os
@@ -30,6 +55,12 @@ RANDOM_STATE = 42
 VAL_FRACTION = 0.10
 PER_CLASS_CAP = 40000
 QUANTILE_LEVELS = [0.10, 0.25, 0.50, 0.75, 0.90]
+STRATEGIES = ("smote", "ros", "none")
+
+def quantile_levels(n):
+    if n == len(QUANTILE_LEVELS):
+        return list(QUANTILE_LEVELS)
+    return [round(i / (n + 1), 4) for i in range(1, n + 1)]
 UNKNOWN_LABEL = 99          # marks held-out rows in y_test; never appears in y_train
 
 WINDOW_FEATURE_SUFFIXES = ["arrival_rate", "byte_rate", "pkt_rate", "mean_dur", "std_dur",
@@ -61,18 +92,20 @@ DATA_DIR = Path("/tmp/tmwork2")
 if not (DATA_DIR / "train_windowed.parquet").exists():
     DATA_DIR = find_dir("data") / "temporal"
 
-def quantile_literals(fit_vals, other_vals, feature_name):
+def quantile_literals(fit_vals, other_vals, feature_name, levels=QUANTILE_LEVELS):
     """Thresholds from fit rows only; every array in other_vals is
     transformed with those same thresholds."""
-    thresholds = np.nanquantile(fit_vals, QUANTILE_LEVELS)
-    names = [f"{feature_name}>Q{int(q*100)}" for q in QUANTILE_LEVELS]
+    thresholds = np.nanquantile(fit_vals, levels)
+    names = [f"{feature_name}>Q{q*100:g}" for q in levels]
     def encode(v):
         v = np.nan_to_num(v, nan=-np.inf)
         return np.stack([(v > t) for t in thresholds], axis=1).astype(np.uint8)
     return encode(fit_vals), [encode(v) for v in other_vals], names
 
-def resample_fit(X_fit, y_fit_full):
-    """Cap majorities at PER_CLASS_CAP, then SMOTE the rest up to it."""
+def resample_fit(X_fit, y_fit_full, strategy="smote"):
+    """Cap majorities at PER_CLASS_CAP, then (smote) synthesise or (ros)
+    duplicate minority rows up to it, or (none) stop at the cap. Returns the
+    rows, labels and a mask of rows that are not real observations."""
     rng = np.random.default_rng(RANDOM_STATE)
     keep_idx = []
     for cls in np.unique(y_fit_full):
@@ -81,6 +114,18 @@ def resample_fit(X_fit, y_fit_full):
                         if len(idx) > PER_CLASS_CAP else idx)
     keep_idx = np.concatenate(keep_idx)
     X_capped, y_capped = X_fit[keep_idx], y_fit_full[keep_idx]
+    if strategy == "none":
+        return X_capped, y_capped, np.zeros(len(y_capped), dtype=bool)
+    if strategy == "ros":
+        extra = []
+        for cls in np.unique(y_capped):
+            idx = np.where(y_capped == cls)[0]
+            if len(idx) < PER_CLASS_CAP:
+                extra.append(rng.choice(idx, PER_CLASS_CAP - len(idx), replace=True))
+        extra = np.concatenate(extra) if extra else np.zeros(0, dtype=int)
+        synth = np.r_[np.zeros(len(y_capped), bool), np.ones(len(extra), bool)]
+        return (np.concatenate([X_capped, X_capped[extra]]),
+                np.concatenate([y_capped, y_capped[extra]]), synth)
     counts = np.bincount(y_capped)
     present = [int(c) for c in np.unique(y_capped)]
     oversamplable = [c for c in present if counts[c] >= 2]
@@ -90,12 +135,22 @@ def resample_fit(X_fit, y_fit_full):
     X_bal_f, y_bal = SMOTE(random_state=RANDOM_STATE, sampling_strategy=targets,
                             k_neighbors=k).fit_resample(X_capped.astype(np.float32), y_capped)
     X_bal = (X_bal_f >= 0.5).astype(np.uint8)
-    return X_bal, y_bal
+    # imblearn returns the original rows first, synthetic rows after them
+    synth = np.arange(len(y_bal)) >= len(y_capped)
+    return X_bal, y_bal, synth
 
 def main():
     held_out_class = sys.argv[1] if len(sys.argv) > 1 else "DoS"
     scales = sys.argv[2].split(",") if len(sys.argv) > 2 else WINDOW_SCALES
-    print(f"=== held out: {held_out_class} | scales: {scales} ===", flush=True)
+    strategy = sys.argv[3] if len(sys.argv) > 3 else "smote"
+    n_q = int(sys.argv[4]) if len(sys.argv) > 4 else len(QUANTILE_LEVELS)
+    if strategy not in STRATEGIES:
+        raise SystemExit(f"strategy must be one of {STRATEGIES}")
+    levels = quantile_levels(n_q)
+    suffix = ("" if strategy == "smote" else f"_{strategy}") + \
+             ("" if n_q == len(QUANTILE_LEVELS) else f"_q{n_q}")
+    print(f"=== held out: {held_out_class} | scales: {scales} | {strategy} | "
+          f"{n_q} quantiles {levels} ===", flush=True)
 
     train_df = pd.read_parquet(DATA_DIR / "train_windowed.parquet")
     test_df = pd.read_parquet(DATA_DIR / "test_windowed.parquet")
@@ -136,7 +191,7 @@ def main():
         fb, (vb, xb), nm = quantile_literals(
             fit_df[col].to_numpy(dtype=np.float64),
             [val_df[col].to_numpy(dtype=np.float64),
-             test_df[col].to_numpy(dtype=np.float64)], col)
+             test_df[col].to_numpy(dtype=np.float64)], col, levels)
         fit_blocks.append(fb); val_blocks.append(vb); test_blocks.append(xb)
         names.extend(nm)
 
@@ -191,23 +246,33 @@ def main():
             fb, (vb, xb), nm = quantile_literals(
                 fit_df[col].to_numpy(dtype=np.float64),
                 [val_df[col].to_numpy(dtype=np.float64),
-                 test_df[col].to_numpy(dtype=np.float64)], col)
+                 test_df[col].to_numpy(dtype=np.float64)], col, levels)
             wf.append(fb); wv.append(vb); wt.append(xb); wn.extend(nm)
         X_fit = np.concatenate([base_fit] + wf, axis=1)
         X_val = np.concatenate([base_val] + wv, axis=1)
         X_test = np.concatenate([base_test] + wt, axis=1)
-        X_bal, y_bal = resample_fit(X_fit, y_fit_full)
+        X_bal, y_bal, synth = resample_fit(X_fit, y_fit_full, strategy)
         del X_fit
         assert X_bal.max() <= 1 and X_val.max() <= 1 and X_test.max() <= 1
 
-        out = find_dir("data") / f"openset_{scale}_{held_out_class.lower()}"
+        base = find_dir("data") / f"openset_{scale}_{held_out_class.lower()}"
+        out = base.with_name(base.name + suffix)
         out.mkdir(parents=True, exist_ok=True)
         np.save(out / "X_fit.npy", X_bal)
         np.save(out / "y_fit.npy", y_bal.astype(np.uint8))
-        np.save(out / "X_val.npy", X_val)
-        np.save(out / "y_val.npy", y_val.astype(np.uint8))
-        np.save(out / "X_test.npy", X_test)
-        np.save(out / "y_test.npy", y_test.astype(np.uint8))
+        np.save(out / "fit_synthetic.npy", synth)
+        for nm, arr in (("X_val", X_val), ("y_val", y_val.astype(np.uint8)),
+                        ("X_test", X_test), ("y_test", y_test.astype(np.uint8))):
+            src = base / f"{nm}.npy"
+            target = out / f"{nm}.npy"
+            if out != base and n_q == len(QUANTILE_LEVELS) and src.exists():
+                # identical partitions across resampling variants, checked
+                assert np.array_equal(np.load(src, mmap_mode="r"), arr), \
+                    f"{nm} differs from the base dataset"
+                target.unlink(missing_ok=True)
+                target.symlink_to(src)
+            else:
+                np.save(target, arr)
         with open(out / "meta.json", "w") as f:
             json.dump({"all_class_names": all_class_names,
                        "held_out_class": held_out_class,
@@ -220,6 +285,8 @@ def main():
                        "n_fit": int(len(y_bal)), "n_val": int(len(y_val)),
                        "n_test": int(len(y_test)),
                        "n_literals": int(X_bal.shape[1]),
+                       "strategy": strategy, "quantile_levels": levels,
+                       "n_synthetic": int(synth.sum()),
                        "val_split_time": str(val_time),
                        "scale": scale, "feature_names": base_names + wn}, f, indent=2)
         print(f"  {scale}: fit {X_bal.shape} val {X_val.shape} test {X_test.shape} "

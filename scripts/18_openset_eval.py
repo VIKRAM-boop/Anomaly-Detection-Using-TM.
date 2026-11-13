@@ -322,7 +322,9 @@ def main():
     runs = {}
     for d in sorted(data.glob(f"banks_{scale}_*_s*")):
         m = re.match(rf"banks_{scale}_(.+)_s(\d+)$", d.name)
-        if m and (d / "banks_meta.json").exists():
+        # resampling variants (banks_<scale>_<family>_<strategy>_s<seed>)
+        # belong to 24_single_stage.py's Task 1 study, not to this one
+        if m and m.group(1) in [x.lower() for x in FAMILY_ORDER] and (d / "banks_meta.json").exists():
             runs.setdefault(m.group(1), {})[int(m.group(2))] = d
     if not runs:
         raise SystemExit(f"no bank runs for scale {scale}")

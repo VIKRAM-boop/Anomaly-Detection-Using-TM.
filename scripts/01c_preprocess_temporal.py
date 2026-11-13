@@ -16,8 +16,16 @@ transformed, never fitted on and never resampled.
 Takes the resampling strategy as argv[1] -- one of smote (every class
 raised to PER_CLASS_CAP), moderate (minorities raised to at most
 MODERATE_MULTIPLE times their real count) or undersample (majorities cut to
-UNDERSAMPLE_CAP, no synthetic rows at all). Writes X_fit/y_fit, X_val/y_val,
-X_test/y_test (literals as uint8) and meta.json to data/temporal_<scale>[_<strategy>]/.
+UNDERSAMPLE_CAP, no synthetic rows at all), ros (majorities capped at
+PER_CLASS_CAP, minorities raised to it by duplicating real rows) or none
+(capped at PER_CLASS_CAP, minorities left at their real size). Optional
+argv[2] sets the number of quantile thresholds per continuous feature (5 is
+the original {10,25,50,75,90}; any other n uses n evenly spaced
+percentiles), and argv[3] a comma-separated list of scales. Writes
+X_fit/y_fit, X_val/y_val, X_test/y_test (literals as uint8) and meta.json to
+data/temporal_<scale>[_<strategy>][_q<n>]/.
+
+Usage: 01c_preprocess_temporal.py [strategy] [quantiles] [scales]
 """
 import json
 import os
@@ -39,7 +47,12 @@ WINDOW_SCALES = ["short", "medium", "long"]
 WINDOW_FEATURE_SUFFIXES = ["arrival_rate", "byte_rate", "pkt_rate", "mean_dur", "std_dur",
                            "mean_tcprtt", "unique_dst", "unique_dst_port", "dst_entropy",
                            "failed_ratio", "burstiness", "proto_nunique", "delta_arrival_rate"]
-STRATEGIES = ("smote", "moderate", "undersample")
+STRATEGIES = ("smote", "moderate", "undersample", "ros", "none")
+
+def quantile_levels(n):
+    if n == len(QUANTILE_LEVELS):
+        return list(QUANTILE_LEVELS)
+    return [round(i / (n + 1), 4) for i in range(1, n + 1)]
 
 DROP_COLS = ["srcip", "sport", "dstip", "dsport", "stime", "ltime", "ts", "label"]
 CATEGORICAL_COLS = ["proto", "service", "state"]
@@ -66,13 +79,13 @@ DATA_DIR = Path("/tmp/tmwork2")
 if not (DATA_DIR / "train_windowed.parquet").exists():
     DATA_DIR = find_dir("data") / "temporal"
 
-def quantile_literals(fit_vals, other_vals, feature_name):
+def quantile_literals(fit_vals, other_vals, feature_name, levels=QUANTILE_LEVELS):
     """Thresholds come from fit_vals only; every array in other_vals is
     transformed with those same thresholds."""
-    thresholds = np.nanquantile(fit_vals, QUANTILE_LEVELS)
-    names = [f"{feature_name}>Q{int(q*100)}" for q in QUANTILE_LEVELS]
+    thresholds = np.nanquantile(fit_vals, levels)
+    names = [f"{feature_name}>Q{q*100:g}" for q in levels]
     def encode(vals):
-        return np.stack([(np.nan_to_num(vals, nan=-np.inf) > t).astype(np.uint32)
+        return np.stack([(np.nan_to_num(vals, nan=-np.inf) > t).astype(np.uint8)
                           for t in thresholds], axis=1)
     return encode(fit_vals), [encode(v) for v in other_vals], names
 
@@ -94,7 +107,7 @@ def resample(X, y, strategy, rng):
         keep = np.concatenate(keep)
         return X[keep], y[keep]
 
-    # both SMOTE paths first cap the majorities, then synthesise upward
+    # the remaining paths first cap the majorities
     keep = []
     for cls in present:
         idx = np.where(y == cls)[0]
@@ -103,6 +116,17 @@ def resample(X, y, strategy, rng):
         keep.append(idx)
     keep = np.concatenate(keep)
     X_capped, y_capped = X[keep], y[keep]
+    if strategy == "none":
+        return X_capped, y_capped
+    if strategy == "ros":
+        extra = []
+        for cls in present:
+            idx = np.where(y_capped == cls)[0]
+            if len(idx) < PER_CLASS_CAP:
+                extra.append(rng.choice(idx, PER_CLASS_CAP - len(idx), replace=True))
+        extra = np.concatenate(extra) if extra else np.zeros(0, dtype=int)
+        return (np.concatenate([X_capped, X_capped[extra]]),
+                np.concatenate([y_capped, y_capped[extra]]))
     capped_counts = np.bincount(y_capped)
     print(f"  after cap: {dict(enumerate(capped_counts))}")
 
@@ -132,7 +156,7 @@ def resample(X, y, strategy, rng):
     # set when the interpolation lands closer to 1 than to 0.
     sampler = SMOTE(random_state=RANDOM_STATE, sampling_strategy=targets, k_neighbors=k)
     X_bal_f, y_bal = sampler.fit_resample(X_capped.astype(np.float32), y_capped)
-    X_bal = (X_bal_f >= 0.5).astype(np.uint32)
+    X_bal = (X_bal_f >= 0.5).astype(np.uint8)
     assert set(np.unique(X_bal)).issubset({0, 1}), "binarization produced non-binary values"
     return X_bal, y_bal
 
@@ -140,7 +164,10 @@ def main():
     strategy = sys.argv[1] if len(sys.argv) > 1 else "smote"
     if strategy not in STRATEGIES:
         raise SystemExit(f"strategy must be one of {STRATEGIES}, got {strategy!r}")
-    print(f"=== resampling strategy: {strategy} ===")
+    n_q = int(sys.argv[2]) if len(sys.argv) > 2 else len(QUANTILE_LEVELS)
+    levels = quantile_levels(n_q)
+    scales = sys.argv[3].split(",") if len(sys.argv) > 3 else WINDOW_SCALES
+    print(f"=== resampling strategy: {strategy} | {n_q} quantiles {levels} | {scales} ===")
 
     print("=== loading windowed parquet ===")
     train_df = pd.read_parquet(DATA_DIR / "train_windowed.parquet")
@@ -181,12 +208,12 @@ def main():
         fb, (vb, xb), names = quantile_literals(
             fit_df[col].to_numpy(dtype=np.float64),
             [val_df[col].to_numpy(dtype=np.float64),
-             test_df[col].to_numpy(dtype=np.float64)], col)
+             test_df[col].to_numpy(dtype=np.float64)], col, levels)
         fit_base_blocks.append(fb); val_base_blocks.append(vb); test_base_blocks.append(xb)
         base_names.extend(names)
 
     print("=== one-hot encoding proto/service/state ===")
-    cat_encoder = OneHotEncoder(handle_unknown="ignore", sparse_output=False, dtype=np.uint32)
+    cat_encoder = OneHotEncoder(handle_unknown="ignore", sparse_output=False, dtype=np.uint8)
     cat_encoder.fit(fit_df[CATEGORICAL_COLS])
     fit_cat = cat_encoder.transform(fit_df[CATEGORICAL_COLS])
     val_cat = cat_encoder.transform(val_df[CATEGORICAL_COLS])
@@ -200,7 +227,7 @@ def main():
     # SMOTE's >=0.5 threshold, leaving test rows holding raw 2s and 4s.
     def binary_block(df):
         return (df[BINARY_PASSTHROUGH_COLS].fillna(0).to_numpy(dtype=np.float64) > 0
-                ).astype(np.uint32)
+                ).astype(np.uint8)
     fit_binary = binary_block(fit_df)
     val_binary = binary_block(val_df)
     test_binary = binary_block(test_df)
@@ -209,8 +236,8 @@ def main():
     rel_names, fit_rel, val_rel, test_rel = [], [], [], []
     for df, store in ((fit_df, fit_rel), (val_df, val_rel), (test_df, test_rel)):
         ratio = (df["sbytes"] + 1) / (df["dbytes"] + 1)
-        store.append((ratio > 2).astype(np.uint32).to_numpy())
-        store.append((ratio < 0.5).astype(np.uint32).to_numpy())
+        store.append((ratio > 2).astype(np.uint8).to_numpy())
+        store.append((ratio < 0.5).astype(np.uint8).to_numpy())
     rel_names += ["R_outbound_heavy", "R_inbound_heavy"]
 
     rel_defs = {
@@ -221,19 +248,19 @@ def main():
         # thresholds from fit rows only
         t1, t2 = np.nanquantile(fit_df[c1], l1), np.nanquantile(fit_df[c2], l2)
         for df, store in ((fit_df, fit_rel), (val_df, val_rel), (test_df, test_rel)):
-            store.append(((df[c1] > t1) & (df[c2] > t2)).astype(np.uint32).to_numpy())
+            store.append(((df[c1] > t1) & (df[c2] > t2)).astype(np.uint8).to_numpy())
         rel_names.append(name)
 
     X_fit_base = np.concatenate(fit_base_blocks + [fit_cat, fit_binary,
-                                 np.stack(fit_rel, axis=1)], axis=1).astype(np.uint32)
+                                 np.stack(fit_rel, axis=1)], axis=1).astype(np.uint8)
     X_val_base = np.concatenate(val_base_blocks + [val_cat, val_binary,
-                                 np.stack(val_rel, axis=1)], axis=1).astype(np.uint32)
+                                 np.stack(val_rel, axis=1)], axis=1).astype(np.uint8)
     X_test_base = np.concatenate(test_base_blocks + [test_cat, test_binary,
-                                  np.stack(test_rel, axis=1)], axis=1).astype(np.uint32)
+                                  np.stack(test_rel, axis=1)], axis=1).astype(np.uint8)
     base_feature_names = base_names + cat_names + BINARY_PASSTHROUGH_COLS + rel_names
     print(f"\nbase literals: {X_fit_base.shape[1]}")
 
-    for scale in WINDOW_SCALES:
+    for scale in scales:
         print(f"\n=== building TM_{scale} dataset ===")
         win_cols = [f"{scale}_{suf}" for suf in WINDOW_FEATURE_SUFFIXES]
         win_fit, win_val, win_test, win_names = [], [], [], []
@@ -241,12 +268,12 @@ def main():
             fb, (vb, xb), names = quantile_literals(
                 fit_df[col].to_numpy(dtype=np.float64),
                 [val_df[col].to_numpy(dtype=np.float64),
-                 test_df[col].to_numpy(dtype=np.float64)], col)
+                 test_df[col].to_numpy(dtype=np.float64)], col, levels)
             win_fit.append(fb); win_val.append(vb); win_test.append(xb); win_names.extend(names)
 
-        X_fit = np.concatenate([X_fit_base] + win_fit, axis=1).astype(np.uint32)
-        X_val = np.concatenate([X_val_base] + win_val, axis=1).astype(np.uint32)
-        X_test = np.concatenate([X_test_base] + win_test, axis=1).astype(np.uint32)
+        X_fit = np.concatenate([X_fit_base] + win_fit, axis=1).astype(np.uint8)
+        X_val = np.concatenate([X_val_base] + win_val, axis=1).astype(np.uint8)
+        X_test = np.concatenate([X_test_base] + win_test, axis=1).astype(np.uint8)
         feature_names = base_feature_names + win_names
         print(f"  {scale}: {X_fit.shape[1]} total literals ({len(win_names)} window-specific)")
 
@@ -255,7 +282,8 @@ def main():
         X_fit_bal, y_fit_bal = resample(X_fit, y_fit_full, strategy, rng)
         print(f"  after {strategy}: {dict(enumerate(np.bincount(y_fit_bal)))}")
 
-        suffix = "" if strategy == "smote" else f"_{strategy}"
+        suffix = ("" if strategy == "smote" else f"_{strategy}") + \
+                 ("" if n_q == len(QUANTILE_LEVELS) else f"_q{n_q}")
         out_dir = find_dir("data") / f"temporal_{scale}{suffix}"
         out_dir.mkdir(parents=True, exist_ok=True)
         np.save(out_dir / "X_fit.npy", X_fit_bal.astype(np.uint8))
@@ -266,7 +294,7 @@ def main():
         np.save(out_dir / "y_test.npy", y_test.astype(np.uint32))
         with open(out_dir / "meta.json", "w") as f:
             json.dump({"class_names": class_names, "feature_names": feature_names,
-                       "strategy": strategy,
+                       "strategy": strategy, "quantile_levels": levels,
                        "n_fit": int(X_fit_bal.shape[0]), "n_val": int(X_val.shape[0]),
                        "n_test": int(X_test.shape[0]),
                        "n_fit_real": int(len(y_fit_full)),
