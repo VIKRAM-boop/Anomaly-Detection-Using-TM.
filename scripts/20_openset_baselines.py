@@ -92,9 +92,12 @@ def find_dir(name):
             return candidate
     return here / name
 
-def load_partitions(family, tr_all, te_all):
-    """Mirrors 09_openset_preprocess.py's partitioning exactly."""
-    le = LabelEncoder().fit(tr_all["attack_cat"])
+def load_partitions(family, tr_all, te_all, tr_full=None):
+    """Mirrors 09_openset_preprocess.py's partitioning exactly. With tr_full
+    (the build that still holds the family), also returns the held-out
+    family's validation-period rows, the pseudo-unknowns 09 saves as
+    X_val_heldout.npy."""
+    le = LabelEncoder().fit(pd.concat([tr_all["attack_cat"], te_all["attack_cat"]]))
     names = list(le.classes_)
     h = names.index(family)
     tr = tr_all.sort_values("ts").reset_index(drop=True)
@@ -110,16 +113,19 @@ def load_partitions(family, tr_all, te_all):
         cols = [c for c in cols if not c.startswith(("short_", "long_"))]
     fit, val = tr.loc[is_fit, cols].copy(), tr.loc[~is_fit, cols].copy()
     test = te_all[cols].copy()
+    src = tr_full if tr_full is not None else tr_all
+    vh = src.loc[(src["attack_cat"] == family) & (src["ts"] >= val_time), cols].copy()
     for c in CAT:
         cats = pd.Categorical(fit[c])
         fit[c] = cats.codes
         val[c] = pd.Categorical(val[c], categories=cats.categories).codes
         test[c] = pd.Categorical(test[c], categories=cats.categories).codes
+        vh[c] = pd.Categorical(vh[c], categories=cats.categories).codes
     f32 = lambda d: np.nan_to_num(d.to_numpy(np.float32), nan=0, posinf=0, neginf=0)
     y_te = le.transform(te_all["attack_cat"])
     y_te[y_te == h] = UNKNOWN_LABEL
     return (f32(fit), y_tr[is_fit], f32(val), y_tr[~is_fit], f32(test), y_te,
-            names, names.index("Normal"))
+            names, names.index("Normal"), f32(vh))
 
 def cap(X, y, rng):
     keep = []
@@ -174,6 +180,16 @@ def run_single_stage(name, proba_val, proba_test, classes, y_val, y_te, known_cl
         res[f"{b:.2f}"] = m
     return res
 
+def save_scores(path, classes, proba_val, proba_test, proba_vh):
+    """Top-two class probabilities and the argmax class for validation and
+    test, so 30_task2_compare.py scores trees and TM with the same code."""
+    out = {}
+    for part, p in (("val", proba_val), ("test", proba_test), ("valheld", proba_vh)):
+        o = np.argsort(p, axis=1)
+        out[f"{part}_top"] = np.take_along_axis(p, o[:, -2:][:, ::-1], 1).astype(np.float32)
+        out[f"{part}_arg"] = np.asarray(classes)[o[:, -1]].astype(np.int16)
+    np.savez_compressed(path, **out)
+
 def select(grid, make, X, y, Xv, yv):
     best, best_f1 = None, -1
     for p in grid:
@@ -205,7 +221,17 @@ def main():
 
     for family in families:
         t0 = time.perf_counter()
-        Xf, yf, Xv, yv, Xt, yt, names, ni = load_partitions(family, tr_all, te_all)
+        # windows rebuilt without this family's training-period flows, as 09 uses
+        excl = data / f"temporal_excl_{family.lower()}"
+        if (excl / "train_windowed.parquet").exists():
+            tr_f = pd.read_parquet(excl / "train_windowed.parquet")
+            te_f = pd.read_parquet(excl / "test_windowed.parquet")
+            for f in (tr_f, te_f):
+                f["attack_cat"] = f["attack_cat"].replace({"Backdoors": "Backdoor"})
+            print(f"  windows: {excl.name}", flush=True)
+        else:
+            tr_f, te_f = tr_all, te_all
+        Xf, yf, Xv, yv, Xt, yt, names, ni, Xh = load_partitions(family, tr_f, te_f, tr_all)
         known_classes = sorted(set(np.unique(yv).tolist()) | set(np.unique(yf).tolist()))
         fams = [c for c in known_classes if c != ni]
         rng = np.random.default_rng(42)
@@ -217,6 +243,7 @@ def main():
             assert np.array_equal(np.load(bd / "y_test.npy"), yt)
             Xc, Xv, Xt = (np.load(bd / f"{n}.npy").astype(np.float32)
                           for n in ("X_fit", "X_val", "X_test"))
+            Xh = np.load(bd / "X_val_heldout.npy").astype(np.float32)
         del Xf
         print(f"\n=== held out {family}: fit {Xc.shape} val {Xv.shape} test {Xt.shape} ===", flush=True)
         fam_res = {"methods": {}}
@@ -241,12 +268,22 @@ def main():
         per_seed = {m: {} for m in ("rf_msp", "xgb_msp", "iforest_rf")}
         if REPR != "continuous":
             del per_seed["iforest_rf"]
+        score_dir = data / "phase5" / "tree_scores" / REPR
+        score_dir.mkdir(parents=True, exist_ok=True)
+        np.save(score_dir / f"{family.lower()}_y_val.npy", yv.astype(np.int16))
+        np.save(score_dir / f"{family.lower()}_y_test.npy", yt.astype(np.int16))
         for s in SEEDS:
             rf = rf_make(rf_best, s).fit(Xc, yc)
-            per_seed["rf_msp"][s] = run_single_stage("rf", rf.predict_proba(Xv), rf.predict_proba(Xt),
+            pv, pt = rf.predict_proba(Xv), rf.predict_proba(Xt)
+            save_scores(score_dir / f"{family.lower()}_rf_s{s}.npz", rf.classes_, pv, pt,
+                        rf.predict_proba(Xh))
+            per_seed["rf_msp"][s] = run_single_stage("rf", pv, pt,
                                                      rf.classes_, yv, yt, known_classes, fams, ni)
             xg = xgb_make(xgb_best, s).fit(Xc, yc_enc, sample_weight=w[yc_enc])
-            per_seed["xgb_msp"][s] = run_single_stage("xgb", xg.predict_proba(Xv), xg.predict_proba(Xt),
+            pv, pt = xg.predict_proba(Xv), xg.predict_proba(Xt)
+            save_scores(score_dir / f"{family.lower()}_xgb_s{s}.npz", classes, pv, pt,
+                        xg.predict_proba(Xh))
+            per_seed["xgb_msp"][s] = run_single_stage("xgb", pv, pt,
                                                       classes, yv, yt, known_classes, fams, ni)
             if REPR != "continuous":
                 print(f"  seed {s}: rf {per_seed['rf_msp'][s]['0.05']['unknown_recall']:.1%}  "

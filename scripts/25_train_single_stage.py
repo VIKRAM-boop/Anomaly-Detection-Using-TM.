@@ -94,6 +94,9 @@ def train_one(job):
     np.save(out / "val_scores.npy", val_s)
     np.save(out / "test_scores.npy", test_s)
     tm_fast.save_model(model, out / "model.npz")
+    if (src / "X_val_heldout.npy").exists():
+        np.save(out / "valheld_scores.npy",
+                tm_fast.class_sums(model, np.load(src / "X_val_heldout.npy")).astype(np.int32))
     pred = np.asarray(classes)[val_s.argmax(1)]
     from sklearn.metrics import precision_recall_fscore_support
     f1 = float(precision_recall_fscore_support(y_val, pred, average="macro", zero_division=0)[2])

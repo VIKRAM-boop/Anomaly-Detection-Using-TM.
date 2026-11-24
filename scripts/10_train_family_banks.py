@@ -99,6 +99,13 @@ def main():
         np.save(out / f"val_{k}.npy", val_s[k])
         np.save(out / f"test_{k}.npy", test_s[k])
         tm_fast.save_model(models[k], out / "models" / f"{k}.npz")
+    # validation-period rows of the held-out family (09), for configuration
+    # selection on validation data by the other folds
+    vh = data_dir / "X_val_heldout.npy"
+    if vh.exists():
+        vh_s = banks.score_banks(models, np.load(vh))
+        for k in models:
+            np.save(out / f"valheld_{k}.npy", vh_s[k])
     with open(out / "banks_meta.json", "w") as f:
         json.dump({"families": families, "normal_idx": normal_idx,
                    "all_class_names": names, "scale": scale, "seed": seed,

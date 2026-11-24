@@ -152,13 +152,21 @@ def main():
     print(f"=== held out: {held_out_class} | scales: {scales} | {strategy} | "
           f"{n_q} quantiles {levels} ===", flush=True)
 
-    train_df = pd.read_parquet(DATA_DIR / "train_windowed.parquet")
-    test_df = pd.read_parquet(DATA_DIR / "test_windowed.parquet")
+    # windows rebuilt without the held-out family's training-period flows
+    # (00b_build_windows_v2.py --exclude) are used when they exist
+    windows_dir = DATA_DIR.with_name(f"temporal_excl_{held_out_class.lower()}")
+    if not (windows_dir / "train_windowed.parquet").exists():
+        windows_dir = DATA_DIR
+    print(f"  windows: {windows_dir}", flush=True)
+    train_df = pd.read_parquet(windows_dir / "train_windowed.parquet")
+    test_df = pd.read_parquet(windows_dir / "test_windowed.parquet")
     train_df["attack_cat"] = train_df["attack_cat"].replace(LABEL_FIXES)
     test_df["attack_cat"] = test_df["attack_cat"].replace(LABEL_FIXES)
 
-    # fitted on the full label set so class indices stay identical across hold-outs
-    target_encoder = LabelEncoder().fit(train_df["attack_cat"])
+    # fitted on the full label set so class indices stay identical across
+    # hold-outs; test is included because rebuilt windows lack the held-out
+    # family in train
+    target_encoder = LabelEncoder().fit(pd.concat([train_df["attack_cat"], test_df["attack_cat"]]))
     all_class_names = list(target_encoder.classes_)
     held_out_idx = all_class_names.index(held_out_class)
     y_test_orig = target_encoder.transform(test_df["attack_cat"])
@@ -180,19 +188,29 @@ def main():
     val_df = train_df.loc[~is_fit].reset_index(drop=True)
     y_fit_full, y_val = y_known[is_fit], y_known[~is_fit]
     del train_df
+    # the held-out family's own validation-period flows: never used by this
+    # fold, they serve as pseudo-unknowns when other folds select a
+    # configuration on validation data (Phase 5, Task 2). Their windows come
+    # from the full build, as the test-period unknowns' do.
+    fam_labels = [held_out_class] + [k for k, v in LABEL_FIXES.items() if v == held_out_class]
+    vh_df = pd.read_parquet(DATA_DIR / "train_windowed.parquet",
+                            filters=[("attack_cat", "in", fam_labels)])
+    vh_df = vh_df[vh_df["ts"] >= val_time].reset_index(drop=True)
+    print(f"  validation-period {held_out_class} rows (pseudo-unknown): {len(vh_df)}", flush=True)
     print(f"  fit={len(fit_df)} < {val_time} <= val={len(val_df)}", flush=True)
 
     # --- scale-independent base literals, thresholds from fit rows only ---
     base_cols = [c for c in fit_df.columns
                  if c not in DROP_COLS + CATEGORICAL_COLS + ["attack_cat"]
                  and not c.startswith(tuple(f"{sc}_" for sc in WINDOW_SCALES))]
-    fit_blocks, val_blocks, test_blocks, names = [], [], [], []
+    fit_blocks, val_blocks, test_blocks, vh_blocks, names = [], [], [], [], []
     for col in base_cols:
-        fb, (vb, xb), nm = quantile_literals(
+        fb, (vb, xb, hb), nm = quantile_literals(
             fit_df[col].to_numpy(dtype=np.float64),
             [val_df[col].to_numpy(dtype=np.float64),
-             test_df[col].to_numpy(dtype=np.float64)], col, levels)
-        fit_blocks.append(fb); val_blocks.append(vb); test_blocks.append(xb)
+             test_df[col].to_numpy(dtype=np.float64),
+             vh_df[col].to_numpy(dtype=np.float64)], col, levels)
+        fit_blocks.append(fb); val_blocks.append(vb); test_blocks.append(xb); vh_blocks.append(hb)
         names.extend(nm)
 
     cat_encoder = OneHotEncoder(handle_unknown="ignore", sparse_output=False, dtype=np.uint8)
@@ -200,6 +218,7 @@ def main():
     fit_blocks.append(cat_encoder.transform(fit_df[CATEGORICAL_COLS]))
     val_blocks.append(cat_encoder.transform(val_df[CATEGORICAL_COLS]))
     test_blocks.append(cat_encoder.transform(test_df[CATEGORICAL_COLS]))
+    vh_blocks.append(cat_encoder.transform(vh_df[CATEGORICAL_COLS]))
     names.extend(cat_encoder.get_feature_names_out(CATEGORICAL_COLS))
 
     # is_ftp_login holds 0/1/2/4 in the raw capture, so it is thresholded
@@ -209,10 +228,11 @@ def main():
     fit_blocks.append(binary_block(fit_df))
     val_blocks.append(binary_block(val_df))
     test_blocks.append(binary_block(test_df))
+    vh_blocks.append(binary_block(vh_df))
     names.extend(BINARY_PASSTHROUGH_COLS)
 
-    rel_fit, rel_val, rel_test = [], [], []
-    for df, store in ((fit_df, rel_fit), (val_df, rel_val), (test_df, rel_test)):
+    rel_fit, rel_val, rel_test, rel_vh = [], [], [], []
+    for df, store in ((fit_df, rel_fit), (val_df, rel_val), (test_df, rel_test), (vh_df, rel_vh)):
         ratio = (df["sbytes"] + 1) / (df["dbytes"] + 1)
         store.append((ratio > 2).to_numpy().astype(np.uint8))
         store.append((ratio < 0.5).to_numpy().astype(np.uint8))
@@ -222,35 +242,39 @@ def main():
         "R_slow_handshake": (("synack", 0.75), ("tcprtt", 0.75)),
     }.items():
         t1, t2 = np.nanquantile(fit_df[c1], l1), np.nanquantile(fit_df[c2], l2)
-        for df, store in ((fit_df, rel_fit), (val_df, rel_val), (test_df, rel_test)):
+        for df, store in ((fit_df, rel_fit), (val_df, rel_val), (test_df, rel_test), (vh_df, rel_vh)):
             store.append(((df[c1] > t1) & (df[c2] > t2)).to_numpy().astype(np.uint8))
         rel_names.append(nm)
     fit_blocks.append(np.stack(rel_fit, axis=1))
     val_blocks.append(np.stack(rel_val, axis=1))
     test_blocks.append(np.stack(rel_test, axis=1))
+    vh_blocks.append(np.stack(rel_vh, axis=1).reshape(len(vh_df), len(rel_vh)))
     names.extend(rel_names)
 
     base_fit = np.concatenate(fit_blocks, axis=1)
     base_val = np.concatenate(val_blocks, axis=1)
     base_test = np.concatenate(test_blocks, axis=1)
-    del fit_blocks, val_blocks, test_blocks
+    base_vh = np.concatenate(vh_blocks, axis=1)
+    del fit_blocks, val_blocks, test_blocks, vh_blocks
     base_names = list(names)
 
     y_test = y_test_orig.copy()
     y_test[y_test_orig == held_out_idx] = UNKNOWN_LABEL
 
     for scale in scales:
-        wf, wv, wt, wn = [], [], [], []
+        wf, wv, wt, wh, wn = [], [], [], [], []
         for suf in WINDOW_FEATURE_SUFFIXES:
             col = f"{scale}_{suf}"
-            fb, (vb, xb), nm = quantile_literals(
+            fb, (vb, xb, hb), nm = quantile_literals(
                 fit_df[col].to_numpy(dtype=np.float64),
                 [val_df[col].to_numpy(dtype=np.float64),
-                 test_df[col].to_numpy(dtype=np.float64)], col, levels)
-            wf.append(fb); wv.append(vb); wt.append(xb); wn.extend(nm)
+                 test_df[col].to_numpy(dtype=np.float64),
+                 vh_df[col].to_numpy(dtype=np.float64)], col, levels)
+            wf.append(fb); wv.append(vb); wt.append(xb); wh.append(hb); wn.extend(nm)
         X_fit = np.concatenate([base_fit] + wf, axis=1)
         X_val = np.concatenate([base_val] + wv, axis=1)
         X_test = np.concatenate([base_test] + wt, axis=1)
+        X_val_heldout = np.concatenate([base_vh] + wh, axis=1)
         X_bal, y_bal, synth = resample_fit(X_fit, y_fit_full, strategy)
         del X_fit
         assert X_bal.max() <= 1 and X_val.max() <= 1 and X_test.max() <= 1
@@ -261,6 +285,7 @@ def main():
         np.save(out / "X_fit.npy", X_bal)
         np.save(out / "y_fit.npy", y_bal.astype(np.uint8))
         np.save(out / "fit_synthetic.npy", synth)
+        np.save(out / "X_val_heldout.npy", X_val_heldout)
         for nm, arr in (("X_val", X_val), ("y_val", y_val.astype(np.uint8)),
                         ("X_test", X_test), ("y_test", y_test.astype(np.uint8))):
             src = base / f"{nm}.npy"
@@ -284,11 +309,12 @@ def main():
                            y_fit_full, minlength=len(all_class_names)).tolist(),
                        "n_fit": int(len(y_bal)), "n_val": int(len(y_val)),
                        "n_test": int(len(y_test)),
+                       "n_val_heldout": int(len(X_val_heldout)),
                        "n_literals": int(X_bal.shape[1]),
                        "strategy": strategy, "quantile_levels": levels,
                        "n_synthetic": int(synth.sum()),
                        "val_split_time": str(val_time),
-                       "scale": scale, "feature_names": base_names + wn}, f, indent=2)
+                       "scale": scale, "windows": windows_dir.name, "feature_names": base_names + wn}, f, indent=2)
         print(f"  {scale}: fit {X_bal.shape} val {X_val.shape} test {X_test.shape} "
               f"-> {out.name}", flush=True)
 
